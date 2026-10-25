@@ -1,0 +1,17 @@
+# Per-actor egress policy, applied with
+#   kubectl ate create egress-policy <actor> -a ${ATESPACE} -f <rendered file>
+#
+# Default-deny everything except the Anthropic API. The gateway terminates TLS
+# for api.anthropic.com and replaces the x-api-key header with the real key.
+#
+# The credential URI comes from CREDENTIAL_URI and names the key in the
+# cluster's credential provider:
+#   k8s.io (kind, upstream):  ate-secret://k8s.io/default/<namespace>/<secret>/<key>
+#   Secret Manager (GKE):     ate-secret://secretmanager.googleapis.com/projects/<p>/secrets/<s>/versions/<v>
+rules:
+- https:
+    hostnames: ["api.anthropic.com"]
+    effects:
+      replaceHeaders:
+      - header: x-api-key
+        credentialUri: ${CREDENTIAL_URI}

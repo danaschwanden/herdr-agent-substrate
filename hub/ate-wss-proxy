@@ -1,0 +1,43 @@
+#!/bin/sh
+# ate-wss-proxy <host>: SSH ProxyCommand from the hub to a substrate actor.
+#
+# Opens a WebSocket to atenet-router over mutual TLS:
+#   - client identity: the hub pod's podidentity certificate
+#     (spiffe://cluster.local/ns/<hub-ns>/sa/herdr-hub), which the router
+#     checks against its --ingress-allowed-spiffe-ids allowlist;
+#   - server identity: the router's servicedns certificate, verified against
+#     the live servicedns ClusterTrustBundle;
+#   - routing: ate-target-actor: <ATESPACE>/<actor>, where <host> is
+#     "ate-<actor>". The router resumes the actor if it is suspended.
+#
+# Pod certificates rotate, so the PKCS#12 copy websocat needs is rebuilt
+# whenever the projected bundle is newer.
+set -eu
+
+host="${1:?usage: ate-wss-proxy <ate-actor>}"
+actor="${host#ate-}"
+: "${ATESPACE:?ATESPACE is not set}"
+bundle="${ATE_IDENTITY_BUNDLE:-/var/run/ate/identity/credential-bundle.pem}"
+trust="${ATE_ROUTER_CA:-/var/run/ate/servicedns/trust-bundle.pem}"
+url="${ATE_ROUTER_URL:-wss://atenet-router.ate-system.svc:443/}"
+
+# Keyed by the bundle's content, not its mtime: a rotated (or different)
+# bundle always gets its own conversion.
+cache="${HOME}/.cache/herdr-hub"
+umask 077
+mkdir -p "${cache}"
+digest="$(sha256sum "${bundle}" | cut -c1-16)"
+p12="${cache}/identity-${digest}.p12"
+if [ ! -s "${p12}" ]; then
+  # The bundle holds the private key followed by the certificate chain.
+  tmp="${p12}.$$"
+  openssl pkcs12 -export -in "${bundle}" -inkey "${bundle}" -passout pass: -out "${tmp}"
+  mv -f "${tmp}" "${p12}"
+  find "${cache}" -name 'identity-*.p12' ! -name "identity-${digest}.p12" -delete 2>/dev/null || true
+fi
+
+# The URL must come before -H: websocat's -H takes several values.
+SSL_CERT_FILE="${trust}" exec websocat --binary --exit-on-eof \
+  --ping-interval 20 --ping-timeout 60 \
+  --client-pkcs12-der "${p12}" \
+  "${url}" -H "ate-target-actor: ${ATESPACE}/${actor}"

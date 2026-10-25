@@ -1,0 +1,62 @@
+# ActorTemplate (protojson-shaped ateapi.ActorTemplate), applied with
+#   kubectl ate create actor-template -f <rendered file>
+#
+# Placeholders are filled by host/herdr-substrate.sh render:
+#   ${ATESPACE}              substrate atespace for the actors
+#   ${ACTOR_IMAGE}           digest-pinned image in the kind registry
+#   ${AUTHORIZED_KEYS_JSON}  your SSH public key, JSON-quoted
+metadata:
+  atespace: ${ATESPACE}
+  name: herdr-agent
+workerSelector:
+  matchLabels:
+    workload: herdr-agents
+containers:
+- name: agent
+  image: ${ACTOR_IMAGE}
+  env:
+  - name: AUTHORIZED_KEYS
+    value: ${AUTHORIZED_KEYS_JSON}
+  # Claude Code sends this placeholder as x-api-key; the egress gateway swaps
+  # in the real key from a Kubernetes Secret (see egress-policy.yaml). The
+  # real key never enters the sandbox, its environment, or its snapshots.
+  - name: ANTHROPIC_API_KEY
+    value: "placeholder-replaced-by-egress-gateway"
+  # Trust the egress gateway's MITM CA so it can inject the credential.
+  # Node keeps its bundled public roots and adds this one.
+  - name: NODE_EXTRA_CA_CERTS
+    value: /run/ate/trust-bundle.pem
+  # Substrate's default capability set is AUDIT_WRITE, KILL, NET_BIND_SERVICE.
+  # OpenSSH additionally needs: SETUID/SETGID (privilege-separated pre-auth
+  # child), SYS_CHROOT (it chroots that child to /var/empty), CHOWN (it chowns
+  # the session's pty). These apply inside the gVisor sandbox only.
+  securityContext:
+    capabilities:
+      add:
+      - SETUID
+      - SETGID
+      - SYS_CHROOT
+      - CHOWN
+  volumeMounts:
+  - name: system-info
+    mountPath: /run/ate
+  # No wakeupProbe: websocat only speaks WebSocket on :80, so an HTTP probe
+  # would never see a 200. Resumes restore the memory snapshot, in which
+  # websocat is already listening.
+volumes:
+- name: system-info
+  systemInfo:
+    dataSources:
+    - trustBundle:
+        names:
+        - egress-mitm.ate.dev
+        path: trust-bundle.pem
+resources:
+  limits:
+    cpuMillicores: 2000
+    memoryBytes: 2684354560 # 2.5Gi, below the worker's 3Gi
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
+  # Snapshots go to the cluster-wide location ate-api-server was installed with
+  # (--snapshot-location). A per-template storageLocation is honored only with
+  # substrate's PerTemplateSnapshotLocation preview gate, so none is set here.

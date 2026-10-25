@@ -1,0 +1,18 @@
+# Test-only: plain ws:// straight to an actor container on 127.0.0.1, used by
+# test/local-bridge-test.sh. The real path (hub -> atenet-router over mTLS)
+# is hub/ate-wss-proxy; substrate's router refuses clients without an
+# allowlisted SPIFFE identity, so this cannot be pointed at a cluster.
+Host ate-*
+    User root
+    IdentityFile ${SSH_KEY}
+    IdentitiesOnly yes
+    # Actors are cloned from one golden snapshot and share its host key, so
+    # pin that one key for all of them.
+    HostKeyAlias herdr-substrate-${ATESPACE}
+    UserKnownHostsFile ${KNOWN_HOSTS_FILE}
+    StrictHostKeyChecking accept-new
+    # Never hand your SSH agent to an untrusted actor.
+    ForwardAgent no
+    # The URL comes before -H: websocat's -H takes several values and would
+    # swallow a URL placed after it.
+    ProxyCommand sh -c 'exec websocat --binary --exit-on-eof --ping-interval 20 --ping-timeout 60 "ws://127.0.0.1:${ROUTER_PORT}/" -H "ate-target-actor: ${ATESPACE}/${1#ate-}"' sh %n

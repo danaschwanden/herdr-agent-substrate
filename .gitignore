@@ -1,0 +1,4 @@
+.env
+.state/
+test/bin/
+hub/bin/

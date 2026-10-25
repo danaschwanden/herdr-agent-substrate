@@ -1,0 +1,9 @@
+# Atespace access policy for ${ATESPACE}, applied with
+#   kubectl ate create access-policy -a ${ATESPACE} -f <rendered file>
+#
+# The hub needs SuspendActor/ResumeActor (atespace editor) and
+# GetActor/ListActors (viewer, implied by editor). Nothing global.
+bindings:
+- role: editor
+  members:
+  - user:system:serviceaccount:${HUB_NAMESPACE}:herdr-hub

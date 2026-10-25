@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# hubctl: actor lifecycle from inside the herdr hub pod.
+#
+# The hub owns both halves of the lifecycle, which is why this runs here:
+#   - herdr's saved-machine list (an enabled machine is reconnected by any
+#     open herdr client, and each reconnect resumes a suspended actor);
+#   - the right to suspend/resume actors (atespace editor via ate-api).
+set -euo pipefail
+
+: "${ATESPACE:?ATESPACE is not set}"
+ATE_API_ENDPOINT="${ATE_API_ENDPOINT:-api.ate-system.svc:443}"
+ATE_API_TOKEN="${ATE_API_TOKEN:-/var/run/ate/api-token/token}"
+IDLE_SECONDS="${IDLE_SECONDS:-300}"
+POLL_SECONDS="${POLL_SECONDS:-30}"
+STATE_DIR="${HOME}/.herdr-hub"
+mkdir -p "${STATE_DIR}"
+
+log()  { printf '[hubctl] %s\n' "$*" >&2; }
+die()  { log "error: $*"; exit 1; }
+
+ate() { kubectl-ate --endpoint "${ATE_API_ENDPOINT}" --token-file "${ATE_API_TOKEN}" "$@"; }
+
+validate_name() {
+  [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "actor name '$1' must be a DNS label"
+}
+
+# machine_id LABEL: herdr profile id of the saved machine with that label.
+machine_id() {
+  herdr machine list --json | python3 -c '
+import json, sys
+rows = [r for r in json.load(sys.stdin) if r["label"] == sys.argv[1]]
+print(rows[0]["id"] if rows else "")' "$1"
+}
+
+cut_tunnel() { pkill -f -- "ate-target-actor: ${ATESPACE}/$1\$" 2>/dev/null || true; }
+
+cmd_add() {
+  local name="${1:?usage: hubctl add <actor>}"; validate_name "${name}"
+  log "first SSH contact with ate-${name} (resumes the actor if suspended)"
+  # -F: OpenSSH finds ~/.ssh/config through the password database, not $HOME.
+  ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-${name}" 'herdr --version' >/dev/null \
+    || die "ssh ate-${name} failed; try: ssh -F ~/.ssh/config -vvv ate-${name} true"
+  if [[ -n "$(machine_id "${name}")" ]]; then
+    log "machine ${name} already saved"
+  else
+    herdr machine add "ate-${name}" --label "${name}"
+  fi
+}
+
+cmd_remove() {
+  local name="${1:?usage: hubctl remove <actor>}" id
+  id="$(machine_id "${name}")"
+  if [[ -n "${id}" ]]; then herdr machine remove "${id}" >/dev/null; fi
+  cut_tunnel "${name}"
+  rm -f "${STATE_DIR}/last-busy.${name}"
+}
+
+cmd_suspend() {
+  local name="${1:?usage: hubctl suspend <actor>}" id
+  id="$(machine_id "${name}")"
+  # 1. No client may reconnect: each reconnect would resume the actor.
+  if [[ -n "${id}" ]]; then herdr machine disable "${id}" >/dev/null; fi
+  # 2. Drop the live tunnel instead of waiting out ControlPersist (600 s).
+  cut_tunnel "${name}"
+  # 3. Snapshot and free the worker.
+  log "suspending ${ATESPACE}/${name}"
+  ate suspend actor "${name}" -a "${ATESPACE}"
+  rm -f "${STATE_DIR}/last-busy.${name}"
+}
+
+cmd_resume() {
+  local name="${1:?usage: hubctl resume <actor>}" id
+  log "resuming ${ATESPACE}/${name}"
+  ate resume actor "${name}" -a "${ATESPACE}"
+  id="$(machine_id "${name}")"
+  if [[ -n "${id}" ]]; then herdr machine enable "${id}" >/dev/null; fi
+  date +%s >"${STATE_DIR}/last-busy.${name}"
+}
+
+# agents_busy LABEL: prints busy, idle or unknown.
+agents_busy() {
+  herdr --machine "$1" agent list 2>/dev/null | python3 -c '
+import json, sys
+try:
+    agents = json.load(sys.stdin)["result"]["agents"]
+except Exception:
+    print("unknown"); sys.exit()
+print("busy" if any(a.get("agent_status") in ("working", "blocked") for a in agents) else "idle")'
+}
+
+# One pass of the idle bridge over every enabled actor machine.
+idle_pass() {
+  local label state marker now
+  now="$(date +%s)"
+  for label in $(herdr machine list --json | python3 -c '
+import json, sys
+for r in json.load(sys.stdin):
+    if r["enabled"] and r["target"].startswith("ate-"):
+        print(r["label"])'); do
+    marker="${STATE_DIR}/last-busy.${label}"
+    state="$(agents_busy "${label}")"
+    case "${state}" in
+      busy|unknown) echo "${now}" >"${marker}" ;;
+      idle)
+        [[ -f "${marker}" ]] || echo "${now}" >"${marker}"
+        if (( now - $(cat "${marker}") >= IDLE_SECONDS )); then
+          log "${label}: no working/blocked agent for ${IDLE_SECONDS}s"
+          cmd_suspend "${label}" || log "suspend of ${label} failed"
+        fi ;;
+    esac
+  done
+}
+
+cmd_idle_watch() {
+  log "idle bridge: suspend actors after ${IDLE_SECONDS}s without working/blocked agents"
+  while :; do
+    idle_pass || log "idle pass failed"
+    sleep "${POLL_SECONDS}"
+  done
+}
+
+cmd_status() {
+  ate get actors -a "${ATESPACE}" || true
+  echo
+  herdr machine list || true
+}
+
+usage() {
+  cat <<EOF
+Usage: hubctl <command> [args]   (atespace: ${ATESPACE})
+
+  add <actor>       pin the actor's host key and save it as herdr machine <actor>
+  remove <actor>    forget the herdr machine
+  suspend <actor>   disable the machine, cut its tunnel, suspend the actor
+  resume <actor>    resume the actor, re-enable the machine
+  idle-watch        loop: suspend actors idle for IDLE_SECONDS (runs as a service)
+  idle-pass         one iteration of idle-watch
+  status            actors and herdr machines
+  ate <args...>     kubectl-ate with the hub's endpoint and token
+  pubkey            the hub's SSH public key (goes into the ActorTemplate)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "${cmd}" in
+    add) cmd_add "$@" ;;
+    remove) cmd_remove "$@" ;;
+    suspend) cmd_suspend "$@" ;;
+    resume) cmd_resume "$@" ;;
+    idle-watch) cmd_idle_watch ;;
+    idle-pass) idle_pass ;;
+    status) cmd_status ;;
+    ate) ate "$@" ;;
+    pubkey) cat "${HOME}/.ssh/id_ed25519.pub" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

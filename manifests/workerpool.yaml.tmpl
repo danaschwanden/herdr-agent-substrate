@@ -1,0 +1,37 @@
+# Kubernetes side: a namespace and a pool of warm gVisor workers.
+# Actors (the agents) are multiplexed onto these workers by substrate.
+#
+# ${WORKER_IMAGE} is the digest-pinned ateworker-gvisor image. The setup script
+# borrows it from the demo-counter WorkerPool, which substrate's own installer
+# built and pushed with the right version stamps.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${K8S_NAMESPACE}
+---
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: herdr-agents
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    workload: herdr-agents
+spec:
+  # Fewer workers than actors on purpose: substrate suspends idle actors to
+  # make room, which is the point of the exercise.
+  replicas: ${WORKER_REPLICAS}
+  workerImage: ${WORKER_IMAGE}
+  sandboxClasses:
+  - name: gvisor
+  template:
+    # Nodes the workers run on, as a YAML flow map: {} (anywhere) on kind. The
+    # production guides reserve a node pool labeled and tainted
+    # ate.dev/sandboxClass=gvisor; ate-controller adds the matching toleration.
+    nodeSelector: ${WORKER_NODE_SELECTOR}
+    resources:
+      limits:
+        cpu: "2"
+        memory: 3Gi
+      requests:
+        cpu: 500m
+        memory: 3Gi

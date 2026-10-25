@@ -1,0 +1,7 @@
+# herdr config for the hub (seeded once into $HOME/.config/herdr/config.toml
+# on the hub's volume; edit it there afterwards).
+#
+# The hub's herdr version must match the actors' (both pinned in the images),
+# so release checks are off: upgrade by rebuilding both images together.
+[update]
+version_check = false

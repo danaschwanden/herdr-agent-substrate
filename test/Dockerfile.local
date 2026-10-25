@@ -1,0 +1,20 @@
+# Offline stand-in for actor/Dockerfile, used by test/local-bridge-test.sh.
+# Same entrypoint, sshd config, herdr and websocat binaries; the base is any
+# local image that already has openssh-server, python3, bash and tini
+# (BASE_IMAGE), so it builds without pulling from a registry.
+#
+# Put the release binaries in test/bin first (same files and SHA-256 as the
+# real Dockerfile), then from the kit root:
+#   docker build -f test/Dockerfile.local --build-arg BASE_IMAGE=<image> -t herdr-actor:local .
+ARG BASE_IMAGE=localbase:host
+FROM ${BASE_IMAGE}
+COPY test/bin/herdr test/bin/websocat /usr/local/bin/
+ENV HOME=/root LANG=C.UTF-8
+RUN mkdir -p /root/.claude /work /run/sshd && herdr integration install claude
+RUN printf '{"hasCompletedOnboarding": true}\n' >/root/.claude.json
+COPY actor/sshd_config /etc/ssh/sshd_config.d/actor.conf
+COPY actor/herdr-config.toml /root/.config/herdr/config.toml
+COPY actor/entrypoint.sh /usr/local/bin/herdr-actor-entrypoint
+RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint
+WORKDIR /work
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/herdr-actor-entrypoint"]

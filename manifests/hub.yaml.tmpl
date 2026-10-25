@@ -1,0 +1,154 @@
+# The herdr hub: herdr client for every actor + lifecycle controller.
+# An ordinary pod, deliberately not an actor (actors may not open WebSocket,
+# CONNECT or raw TCP egress, and hold no credentials or ate-api access).
+#
+# Placeholders (rendered by host/herdr-substrate.sh hub):
+#   ${HUB_NAMESPACE}  ${HUB_IMAGE}  ${ATESPACE}  ${IDLE_SECONDS}  ${POLL_SECONDS}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${HUB_NAMESPACE}
+  labels:
+    # ate-system's NetworkPolicy admits ate-api clients only from namespaces
+    # with this label.
+    ate.dev/api-access: "true"
+---
+# Its identity everywhere:
+#   router mTLS:  spiffe://cluster.local/ns/${HUB_NAMESPACE}/sa/herdr-hub
+#                 (must be in the install's ATE_INGRESS_ALLOWED_SPIFFE_IDS)
+#   ate-api:      system:serviceaccount:${HUB_NAMESPACE}:herdr-hub
+#                 (atespace editor on ${ATESPACE}, see hub-access-policy)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: herdr-hub
+  namespace: ${HUB_NAMESPACE}
+---
+# kubectl-ate verifies ate-api's serving certificate against the live
+# servicedns ClusterTrustBundle, which it reads through the Kubernetes API.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: herdr-hub-trust-bundles
+rules:
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["clustertrustbundles"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: herdr-hub-trust-bundles
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: herdr-hub-trust-bundles
+subjects:
+- kind: ServiceAccount
+  name: herdr-hub
+  namespace: ${HUB_NAMESPACE}
+---
+# HOME of the hub: herdr's saved machines, the hub SSH key, known_hosts,
+# idle timers. Small, and the only state the hub has.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: herdr-hub-home
+  namespace: ${HUB_NAMESPACE}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: herdr-hub
+  namespace: ${HUB_NAMESPACE}
+  labels:
+    app: herdr-hub
+spec:
+  replicas: 1
+  # One hub at a time: two would both own the machines and the idle bridge.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: herdr-hub
+  template:
+    metadata:
+      labels:
+        app: herdr-hub
+    spec:
+      serviceAccountName: herdr-hub
+      containers:
+      - name: hub
+        image: ${HUB_IMAGE}
+        env:
+        - name: ATESPACE
+          value: "${ATESPACE}"
+        - name: ATE_API_ENDPOINT
+          value: api.ate-system.svc:443
+        - name: ATE_API_TOKEN
+          value: /var/run/ate/api-token/token
+        - name: ATE_IDENTITY_BUNDLE
+          value: /var/run/ate/identity/credential-bundle.pem
+        - name: ATE_ROUTER_CA
+          value: /var/run/ate/servicedns/trust-bundle.pem
+        - name: ATE_ROUTER_URL
+          value: wss://atenet-router.ate-system.svc:443/
+        - name: IDLE_SECONDS
+          value: "${IDLE_SECONDS}"
+        - name: POLL_SECONDS
+          value: "${POLL_SECONDS}"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        volumeMounts:
+        - name: home
+          mountPath: /var/lib/herdr-hub
+        - name: identity
+          mountPath: /var/run/ate/identity
+          readOnly: true
+        - name: servicedns
+          mountPath: /var/run/ate/servicedns
+          readOnly: true
+        - name: api-token
+          mountPath: /var/run/ate/api-token
+          readOnly: true
+      volumes:
+      - name: home
+        persistentVolumeClaim:
+          claimName: herdr-hub-home
+      # Client certificate for the router's mTLS listener, from substrate's
+      # podidentity signer (same projected source substrate's own pods use).
+      - name: identity
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+      # Trust anchors for the router's and ate-api's serving certificates.
+      - name: servicedns
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+      # ate-api bearer token; its audience is ate-api's in-cluster name.
+      - name: api-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: api.ate-system.svc
+              expirationSeconds: 3600
+              path: token

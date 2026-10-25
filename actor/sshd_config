@@ -1,0 +1,33 @@
+# Included first by Debian's /etc/ssh/sshd_config, so these values win.
+#
+# sshd only listens on loopback. The only way in is websocat on :80, which
+# substrate's router reaches with `ate-target-actor: <atespace>/<actor>`.
+Port 2222
+ListenAddress 127.0.0.1
+
+HostKey /etc/ssh/actor/ssh_host_ed25519_key
+AuthorizedKeysFile /etc/ssh/actor/authorized_keys
+PidFile /run/sshd-actor.pid
+
+# Substrate runs every actor process as UID 0, so herdr logs in as root.
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+
+# Herdr's saved machines only need exec channels over stdio.
+# Refuse everything that could tunnel back out of (or into) the sandbox.
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+GatewayPorts no
+X11Forwarding no
+
+ClientAliveInterval 30
+ClientAliveCountMax 4
+PrintMotd no
+LogLevel INFO
+# No Subsystem line: Debian's main sshd_config already defines sftp, and
+# OpenSSH 9.2 (bookworm) treats a second definition as a fatal error.

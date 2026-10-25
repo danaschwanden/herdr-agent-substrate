@@ -1,0 +1,287 @@
+# Builds the kit's two images for linux/amd64 and linux/arm64 and publishes them
+# to GitHub Container Registry:
+#
+#   ghcr.io/<owner>/herdr-actor   the agent: herdr server + Claude Code
+#   ghcr.io/<owner>/herdr-hub     the herdr client + hubctl, one build per
+#                                 substrate release (its kubectl-ate must match
+#                                 the cluster's substrate)
+#
+# Pull requests build both images without pushing. Pushes to main publish
+# `edge` tags; tags vX.Y.Z publish X.Y.Z. Every push also gets a `sha-<commit>`
+# tag, and pushed images get a signed SLSA provenance attestation (public
+# repositories, or GitHub Enterprise Cloud).
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables):
+#   CLAUDE_CODE_VERSION  Claude Code release baked into herdr-actor. Unset: the
+#                        latest release at build time, recorded in the image's
+#                        labels and in the run summary.
+#   SUBSTRATE_REFS       comma-separated substrate tags or commits to build
+#                        herdr-hub for. Unset: v0.6.0.
+#
+# See "Prebuilt images" in the README.
+name: images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "actor/**"
+      - "hub/**"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+    inputs:
+      claude_code_version:
+        description: Claude Code release for herdr-actor (empty uses CLAUDE_CODE_VERSION, then the latest)
+        required: false
+        default: ""
+      substrate_refs:
+        description: Comma-separated substrate refs to build herdr-hub for (empty uses SUBSTRATE_REFS, then v0.6.0)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      owner: ${{ steps.plan.outputs.owner }}
+      push: ${{ steps.plan.outputs.push }}
+      claude_code_version: ${{ steps.plan.outputs.claude_code_version }}
+      substrate_refs: ${{ steps.plan.outputs.substrate_refs }}
+    steps:
+      - id: plan
+        env:
+          INPUT_CLAUDE: ${{ inputs.claude_code_version }}
+          VAR_CLAUDE: ${{ vars.CLAUDE_CODE_VERSION }}
+          INPUT_REFS: ${{ inputs.substrate_refs }}
+          VAR_REFS: ${{ vars.SUBSTRATE_REFS }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >>"$GITHUB_OUTPUT"
+          if [[ "${EVENT}" == pull_request ]]; then
+            echo "push=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "push=true" >>"$GITHUB_OUTPUT"
+          fi
+          claude="${INPUT_CLAUDE:-${VAR_CLAUDE:-}}"
+          if [[ -z "${claude}" ]]; then
+            claude="$(npm view @anthropic-ai/claude-code version)"
+          fi
+          [[ "${claude}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "bad Claude Code version: ${claude}" >&2; exit 1; }
+          echo "claude_code_version=${claude}" >>"$GITHUB_OUTPUT"
+          refs="${INPUT_REFS:-${VAR_REFS:-v0.6.0}}"
+          python3 - "${refs}" >>"$GITHUB_OUTPUT" <<'PY'
+          import json, re, sys
+          refs = [r.strip() for r in sys.argv[1].split(",") if r.strip()]
+          for r in refs:
+              if not re.fullmatch(r"[0-9A-Za-z._-]+", r):
+                  sys.exit(f"bad substrate ref: {r}")
+          print("substrate_refs=" + json.dumps(refs))
+          PY
+          {
+            echo "### Plan"
+            echo "- Claude Code: \`${claude}\`"
+            echo "- herdr-hub for substrate: \`${refs}\`"
+            echo "- push: $([[ "${EVENT}" == pull_request ]] && echo no || echo yes)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  actor:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      IMAGE: ghcr.io/${{ needs.plan.outputs.owner }}/herdr-actor
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - if: needs.plan.outputs.push == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=edge,branch=main
+            type=sha,format=long
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=herdr-actor
+            org.opencontainers.image.description=herdr server and Claude Code for an agent-substrate actor
+            dev.herdr-substrate.claude-code.version=${{ needs.plan.outputs.claude_code_version }}
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: actor
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            CLAUDE_CODE_VERSION=${{ needs.plan.outputs.claude_code_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ needs.plan.outputs.push == 'true' }}
+          cache-from: type=gha,scope=herdr-actor
+          cache-to: type=gha,scope=herdr-actor,mode=max
+
+      - if: needs.plan.outputs.push == 'true' && !github.event.repository.private
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - if: needs.plan.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### herdr-actor"
+            echo '```'
+            echo "ACTOR_IMAGE=${IMAGE}@${DIGEST}"
+            echo '```'
+            echo "Tags:"
+            while IFS= read -r tag; do
+              if [[ -n "${tag}" ]]; then echo "- \`${tag}\`"; fi
+            done <<<"${TAGS}"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  hub:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        substrate_ref: ${{ fromJSON(needs.plan.outputs.substrate_refs) }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      IMAGE: ghcr.io/${{ needs.plan.outputs.owner }}/herdr-hub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out substrate ${{ matrix.substrate_ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: agent-substrate/substrate
+          ref: ${{ matrix.substrate_ref }}
+          path: substrate
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: substrate/go.mod
+          cache: false
+
+      - name: Build kubectl-ate for each platform
+        id: kubectl_ate
+        working-directory: substrate
+        run: |
+          set -euo pipefail
+          for platform in ${PLATFORMS//,/ }; do
+            arch="${platform#linux/}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+              go build -trimpath -o "../hub/bin/linux-${arch}/kubectl-ate" ./cmd/kubectl-ate
+          done
+          echo "commit=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+          ls -l ../hub/bin/*/kubectl-ate
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - if: needs.plan.outputs.push == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
+            suffix=-substrate-${{ matrix.substrate_ref }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=edge,branch=main
+            type=sha,format=long
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=herdr-hub
+            org.opencontainers.image.description=herdr client and hubctl for agent-substrate actors
+            dev.herdr-substrate.substrate.ref=${{ matrix.substrate_ref }}
+            dev.herdr-substrate.substrate.commit=${{ steps.kubectl_ate.outputs.commit }}
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: hub
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ needs.plan.outputs.push == 'true' }}
+          cache-from: type=gha,scope=herdr-hub
+          cache-to: type=gha,scope=herdr-hub,mode=max
+
+      - if: needs.plan.outputs.push == 'true' && !github.event.repository.private
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - if: needs.plan.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          REF: ${{ matrix.substrate_ref }}
+        run: |
+          {
+            echo "### herdr-hub for substrate ${REF}"
+            echo '```'
+            echo "HUB_IMAGE=${IMAGE}@${DIGEST}"
+            echo '```'
+            echo "Tags:"
+            while IFS= read -r tag; do
+              if [[ -n "${tag}" ]]; then echo "- \`${tag}\`"; fi
+            done <<<"${TAGS}"
+          } >>"$GITHUB_STEP_SUMMARY"

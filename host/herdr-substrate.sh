@@ -43,6 +43,11 @@ WORKER_NODE_SELECTOR="${WORKER_NODE_SELECTOR:-{\}}"
 # with any other provider the key is stored outside this kit, and CREDENTIAL_URI
 # must name it.
 CREDENTIAL_PROVIDER="${CREDENTIAL_PROVIDER:-k8s.io}"
+# Prebuilt images (e.g. from the kit's GitHub workflow) instead of `image` and
+# `hub-image`: a tag, resolved to its digest when used, or a digest reference.
+# The hub image's kubectl-ate must come from the cluster's substrate release.
+ACTOR_IMAGE="${ACTOR_IMAGE:-}"
+HUB_IMAGE="${HUB_IMAGE:-}"
 CREDENTIAL_URI="${CREDENTIAL_URI:-ate-secret://k8s.io/default/${SECRETS_NAMESPACE}/anthropic/api-key}"
 STATE_DIR="${KIT_DIR}/.state"
 mkdir -p "${STATE_DIR}"
@@ -168,6 +173,28 @@ remote_digest() {
   docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null | json_get digest
 }
 
+# pinned_image NAME REF BUILD_CMD: NAME's digest-pinned reference. REF (a
+# prebuilt image, by tag or digest) wins; otherwise what BUILD_CMD recorded.
+pinned_image() {
+  local name="$1" ref="$2" build_cmd="$3" repo digest
+  if [[ -z "${ref}" ]]; then
+    [[ -s "${STATE_DIR}/${name}-image" ]] || die "no ${name} image: run '$0 ${build_cmd}', or set a prebuilt one in .env"
+    cat "${STATE_DIR}/${name}-image"
+    return
+  fi
+  if [[ "${ref}" == *@sha256:* ]]; then
+    echo "${ref}"
+    return
+  fi
+  # Drop the tag (the last ':' after the last '/'; a registry port stays).
+  repo="${ref}"
+  [[ "${repo##*/}" == *:* ]] && repo="${repo%:*}"
+  digest="$(remote_digest "${ref}" || true)"
+  [[ "${digest}" == sha256:* ]] || die "could not resolve ${ref} to a digest (does it exist, and is it public or are you logged in?)"
+  log "${name}: ${ref} is ${digest}"
+  echo "${repo}@${digest}"
+}
+
 # build_push DIR NAME: build DIR for image_platform, push it to REGISTRY, and
 # record NAME's digest-pinned reference in .state/NAME-image.
 build_push() {
@@ -259,17 +286,18 @@ cmd_hub_image() {
   local arch; arch="$(image_platform)"; arch="${arch#linux/}"
   [[ "${arch}" != *,* ]] || die "PLATFORM must name one platform for the hub image (kubectl-ate is built for it), got $(image_platform)"
   log "building kubectl-ate for linux/${arch} from ${SUBSTRATE_DIR}"
-  mkdir -p "${KIT_DIR}/hub/bin"
+  mkdir -p "${KIT_DIR}/hub/bin/linux-${arch}"
   ( cd "${SUBSTRATE_DIR}" && CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
-      go build -o "${KIT_DIR}/hub/bin/kubectl-ate" ./cmd/kubectl-ate )
+      go build -trimpath -o "${KIT_DIR}/hub/bin/linux-${arch}/kubectl-ate" ./cmd/kubectl-ate )
   build_push "${KIT_DIR}/hub" herdr-hub
 }
 
 cmd_hub() {
   need kubectl python3
-  [[ -f "${STATE_DIR}/herdr-hub-image" ]] || die "run '$0 hub-image' first"
+  local hub_image
+  hub_image="$(pinned_image herdr-hub "${HUB_IMAGE}" hub-image)"
   export HUB_NAMESPACE ATESPACE IDLE_SECONDS POLL_SECONDS
-  export HUB_IMAGE; HUB_IMAGE="$(cat "${STATE_DIR}/herdr-hub-image")"
+  export HUB_IMAGE="${hub_image}"
   log "deploying the hub in namespace ${HUB_NAMESPACE}"
   render "${KIT_DIR}/manifests/hub.yaml.tmpl" | k apply -f -
   k -n "${HUB_NAMESPACE}" rollout status deployment/herdr-hub --timeout=5m
@@ -337,7 +365,8 @@ grant_hub_access() {
 
 cmd_deploy() {
   need kubectl kubectl-ate python3
-  [[ -f "${STATE_DIR}/herdr-actor-image" ]] || die "run '$0 image' first"
+  local actor_image
+  actor_image="$(pinned_image herdr-actor "${ACTOR_IMAGE}" image)"
   # The template trusts the hub's SSH key; .state is per-checkout, so fetch
   # the key from the running hub when the local copy is missing.
   [[ -s "${STATE_DIR}/hub.pub" ]] || hub hubctl pubkey >"${STATE_DIR}/hub.pub" 2>/dev/null || true
@@ -355,7 +384,7 @@ cmd_deploy() {
 
   export ATESPACE K8S_NAMESPACE SECRETS_NAMESPACE WORKER_REPLICAS WORKER_NODE_SELECTOR
   export WORKER_IMAGE="${worker_image}"
-  export ACTOR_IMAGE; ACTOR_IMAGE="$(cat "${STATE_DIR}/herdr-actor-image")"
+  export ACTOR_IMAGE="${actor_image}"
   export AUTHORIZED_KEYS_JSON; AUTHORIZED_KEYS_JSON="$(json_quote <"${STATE_DIR}/hub.pub")"
 
   log "applying WorkerPool (${WORKER_REPLICAS} workers) in namespace ${K8S_NAMESPACE}"

@@ -590,6 +590,26 @@ host/herdr-substrate.sh hub-image
 host/herdr-substrate.sh hub
 ```
 
+**Or use the images from the kit's GitHub workflow** ([Prebuilt images](../README.md#prebuilt-images-from-github))
+instead of building them here. Verify their provenance and copy them into your own registry, so the cluster
+never pulls from GitHub. Then point `.env` at the copies and start the hub without building anything:
+
+```bash
+GHCR_OWNER=your-github-owner
+KIT_VERSION=1.2.3
+gh attestation verify "oci://ghcr.io/$GHCR_OWNER/herdr-actor:$KIT_VERSION" --owner "$GHCR_OWNER"
+gh attestation verify "oci://ghcr.io/$GHCR_OWNER/herdr-hub:$KIT_VERSION-substrate-$SUBSTRATE_VERSION" --owner "$GHCR_OWNER"
+docker buildx imagetools create --tag "$KIT_REPO/herdr-actor:$KIT_VERSION" "ghcr.io/$GHCR_OWNER/herdr-actor:$KIT_VERSION"
+docker buildx imagetools create --tag "$KIT_REPO/herdr-hub:$KIT_VERSION-substrate-$SUBSTRATE_VERSION" "ghcr.io/$GHCR_OWNER/herdr-hub:$KIT_VERSION-substrate-$SUBSTRATE_VERSION"
+printf 'ACTOR_IMAGE=%s\nHUB_IMAGE=%s\n' "$KIT_REPO/herdr-actor:$KIT_VERSION" "$KIT_REPO/herdr-hub:$KIT_VERSION-substrate-$SUBSTRATE_VERSION" >> "$KIT_DIR/.env"
+cd "$KIT_DIR"
+host/herdr-substrate.sh check
+host/herdr-substrate.sh hub
+```
+
+The copies cover both platforms. Use a `herdr-hub` built for `$SUBSTRATE_VERSION`, the workflow's default.
+With prebuilt images, the repository variable `CLAUDE_CODE_VERSION` pins Claude Code, not `.env`.
+
 `hub-image` builds `kubectl-ate` from `$SUBSTRATE_DIR`, so the hub's client matches the cluster.
 
 ## 11. Harden the hub

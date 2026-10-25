@@ -2,8 +2,9 @@
 # Runs as an ordinary Kubernetes pod (not an actor): it holds the SSH key to
 # every actor and ate-api access, which substrate keeps out of sandboxes.
 #
-# bin/kubectl-ate is built from your substrate checkout by
-# `host/herdr-substrate.sh hub-image` (same commit as the cluster).
+# bin/linux-<arch>/kubectl-ate is built from a substrate checkout at the same
+# release as the cluster: by `host/herdr-substrate.sh hub-image` for one
+# platform, or by .github/workflows/images.yml for each platform it publishes.
 FROM debian:bookworm-slim
 
 ARG TARGETARCH
@@ -35,7 +36,7 @@ RUN set -eu; \
     echo "${websocat_sha}  /usr/local/bin/websocat" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/herdr /usr/local/bin/websocat
 
-COPY bin/kubectl-ate /usr/local/bin/kubectl-ate
+COPY bin/linux-${TARGETARCH}/kubectl-ate /usr/local/bin/kubectl-ate
 COPY ate-wss-proxy hubctl /usr/local/bin/
 COPY entrypoint.sh /usr/local/bin/herdr-hub-entrypoint
 COPY herdr-config.toml /etc/herdr-hub/herdr-config.toml

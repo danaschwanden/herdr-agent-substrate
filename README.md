@@ -235,6 +235,9 @@ host/herdr-substrate.sh hub-image
 
 Each ends with a line like `herdr-actor: localhost:5001/herdr-actor@sha256:…`.
 
+If your copy of the kit is on GitHub with its image workflow enabled, you can skip this step and use the
+published images instead ([Prebuilt images](#prebuilt-images-from-github)).
+
 ### 9. Deploy the hub
 
 ```bash
@@ -644,8 +647,8 @@ only apply to the kind registry.
 |---|---|
 | `check` | tools, substrate checkout, Docker reachable, buildx builder driver, free disk space (once the cluster exists) |
 | `cluster` | substrate's `create-kind-cluster.sh`; `install-ate-kind.sh deploy ate-system` with the k8s.io credential provider and the hub in `ATE_INGRESS_ALLOWED_SPIFFE_IDS`; `deploy demo counter` (scaled to 0 workers, used for its worker image); `go install ./cmd/kubectl-ate` |
-| `image` | builds `actor/`, pushes to `localhost:5001`, records the digest (templates must be digest-pinned) |
-| `hub-image` | cross-builds `kubectl-ate` from your substrate checkout into `hub/bin/`, builds and pushes `hub/` |
+| `image` | builds `actor/`, pushes to `REGISTRY` (`localhost:5001`), records the digest (templates must be digest-pinned). Not needed with a prebuilt `ACTOR_IMAGE` |
+| `hub-image` | cross-builds `kubectl-ate` from your substrate checkout into `hub/bin/linux-<arch>/`, builds and pushes `hub/`. Not needed with a prebuilt `HUB_IMAGE` |
 | `hub` | applies `manifests/hub.yaml.tmpl`; waits for the hub's SSH key |
 | `deploy` | WorkerPool, Anthropic Secret + credential-provider grant, atespace, hub access policy, ActorTemplate trusting the hub key; waits for the golden snapshot |
 | `actor <name>` | creates the actor and its egress policy |
@@ -958,6 +961,61 @@ sequenceDiagram
   1) and the namespaces and RBAC (kubectl). The cluster, and substrate in it, stay.
 - `up` runs `cluster`, `image`, `hub-image`, `hub`, `deploy`, then `actor` and `machine` for each name.
 
+## Prebuilt images from GitHub
+
+`.github/workflows/images.yml` builds both of the kit's images for `linux/amd64` and `linux/arm64`, and publishes
+them to GitHub Container Registry. It runs when the kit is the root of a GitHub repository with Actions enabled.
+
+- **`ghcr.io/<owner>/herdr-actor`** has no substrate dependency, so one build serves every cluster.
+- **`ghcr.io/<owner>/herdr-hub`** is built once per substrate release. Its `kubectl-ate` has to come from the
+  same release as the cluster, because substrate's API changes between releases. Each build's tags end in
+  `-substrate-<release>`.
+
+| Event | `herdr-actor` tags | `herdr-hub` tags |
+|---|---|---|
+| Push to `main` | `edge`, `sha-<commit>` | `edge-substrate-v0.6.0`, `sha-<commit>-substrate-v0.6.0` |
+| Tag `v1.2.3` | `1.2.3`, `sha-<commit>` | `1.2.3-substrate-v0.6.0`, `sha-<commit>-substrate-v0.6.0` |
+| Pull request | built, not pushed | built, not pushed |
+| Run workflow (manual) | as for the branch or tag it runs on; input `claude_code_version` overrides the variable below | same; input `substrate_refs` overrides the variable below |
+
+Each run's summary lists the digest-pinned references, ready to paste into `.env`. In a public repository, every
+pushed image also gets a signed SLSA build-provenance attestation. Check one with:
+
+```bash
+gh attestation verify oci://ghcr.io/OWNER/herdr-actor:1.2.3 --owner OWNER
+```
+
+**Setting it up.**
+
+1. Push the kit to a GitHub repository, with the kit's files at the root.
+2. Optionally, set two repository variables (*Settings → Secrets and variables → Actions → Variables*):
+   - `CLAUDE_CODE_VERSION` pins the Claude Code release in `herdr-actor`. Without it, each build takes the
+     latest release and records it in the image's labels and the run summary.
+   - `SUBSTRATE_REFS` is a comma-separated list of substrate releases or commits to build `herdr-hub` for. The
+     default is `v0.6.0`.
+3. After the first run, open each package (`herdr-actor`, `herdr-hub`) under your profile's or organization's
+   *Packages*, and set its visibility to **public**. The images carry the repository in their labels, so
+   GitHub shows them linked to it. GitHub creates new packages as private, and
+   cluster nodes pull these images without credentials. atelet pulls actor images anonymously unless a kubelet
+   credential provider is configured, and the manifests carry no image pull secrets.
+
+**Using them.** Set the images in `.env`, by tag or by digest. The script resolves a tag to its digest when it
+uses it, because templates must be digest-pinned. Then skip `image` and `hub-image`:
+
+```bash
+cat >> .env <<'EOF'
+ACTOR_IMAGE=ghcr.io/OWNER/herdr-actor:1.2.3
+HUB_IMAGE=ghcr.io/OWNER/herdr-hub:1.2.3-substrate-v0.6.0
+EOF
+```
+
+Pick the `herdr-hub` build whose substrate release matches the cluster's:
+
+- **Quick start:** substrate is checked out from `main`. Either keep building the hub with `hub-image`, or check
+  out the same substrate commit you added to `SUBSTRATE_REFS` before running `cluster`.
+- **Production:** the guides pin `v0.6.0`, the workflow's default. They copy the images into your own registry
+  instead of pulling from GitHub; see their step 10.
+
 ## Configuration
 
 Set in `.env` (see `.env.example`) or the environment. The quick start sets `ANTHROPIC_API_KEY` and, on Docker
@@ -992,6 +1050,8 @@ The production guides add these. Their defaults are the quick start's.
 | `CREDENTIAL_PROVIDER` | `k8s.io` | the cluster's egress credential provider; any other value makes `deploy` skip the Secret and its grant |
 | `CREDENTIAL_URI` | `ate-secret://k8s.io/default/$SECRETS_NAMESPACE/anthropic/api-key` | key reference written into each actor's egress policy |
 | `ATE_CLIENT_SERVICE_ACCOUNT` | — (substrate: `ate-client`) | read by kubectl-ate: the ServiceAccount in `ate-system` it acts as |
+| `ACTOR_IMAGE` | — (what `image` built) | prebuilt actor image, by tag or digest ([Prebuilt images](#prebuilt-images-from-github)) |
+| `HUB_IMAGE` | — (what `hub-image` built) | prebuilt hub image; its substrate release must match the cluster's |
 
 ## Disk and resources (quick start)
 
@@ -1012,7 +1072,7 @@ fails in ways that look unrelated.
 | Path | Purpose |
 |---|---|
 | `actor/Dockerfile`, `actor/entrypoint.sh`, `actor/sshd_config`, `actor/herdr-config.toml` | the agent actor: Claude Code and a herdr server behind sshd behind websocat :80; pinned binaries; Claude onboarding pre-completed |
-| `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge |
+| `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge; takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
 | `hub/ate-wss-proxy` | SSH ProxyCommand: mTLS WebSocket to atenet-router with the pod's SPIFFE certificate |
 | `hub/hubctl` | add/remove machines, suspend/resume, idle bridge, `ate` passthrough |
 | `manifests/hub.yaml.tmpl` | hub namespace (`ate.dev/api-access=true`), ServiceAccount, ClusterTrustBundle read RBAC, PVC, Deployment with projected identity, trust and token volumes |
@@ -1023,6 +1083,7 @@ fails in ways that look unrelated.
 | `manifests/anthropic-secret.yaml.tmpl` | the real key, in its own namespace |
 | `host/herdr-substrate.sh` | every command above |
 | `docs/production-gke.md`, `docs/production-kubernetes.md` | production deployments on GKE and on upstream Kubernetes |
+| `.github/workflows/images.yml` | builds and publishes `herdr-actor` and `herdr-hub` (per substrate release) to GHCR, multi-arch, with provenance |
 | `test/` | `local-bridge-test.sh`, `hub-path-test.sh`, `fake_router.py`, `ssh_config.tmpl`, `Dockerfile.local` |
 | `.state/` | created by the script: image digests, the hub's public key, rendered manifests. Per checkout; safe to delete |
 
@@ -1064,6 +1125,16 @@ cluster. What was checked offline:
 | RBAC, ConfigMaps, DaemonSet and the generated hub NetworkPolicy | `kubeconform -strict` | 15/15 valid |
 | Every command block, both guides | `bash -n`, `zsh -n`, no zsh comment or `!` pitfalls | 68/68 |
 | New script settings; defaults render exactly as before | template rendering, `shellcheck` | pass |
+
+**Image workflow** (build environment, 2026-10-25). It has not yet run on GitHub. What was checked offline:
+
+| Check | How | Result |
+|---|---|---|
+| Workflow syntax, expressions, permissions and its shell steps | `actionlint` 1.7.12 with `shellcheck` | clean |
+| Every action's inputs, at the pinned commit | read from each action's `action.yml` | match |
+| Plan and summary steps | run locally with sample variables | pass |
+| Hub image takes `kubectl-ate` from `bin/linux-$TARGETARCH`; fails clearly when an architecture is missing | offline build on `localbase:host` | pass |
+| `ACTOR_IMAGE`/`HUB_IMAGE` by tag, digest and registry port; missing images stop before touching the cluster | script run with stubs | pass |
 
 ## Tests
 
@@ -1208,3 +1279,6 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   `CLAUDE_CODE_VERSION`, `WORKER_IMAGE`, `WORKER_NODE_SELECTOR`, `CREDENTIAL_PROVIDER` and `CREDENTIAL_URI`, and
   reads digests from remote registries. Defaults leave kind unchanged. The actor template no longer sets
   `snapshotConfig.storageLocation`, which substrate ignores without its `PerTemplateSnapshotLocation` preview gate.
+- **Prebuilt images:** a GitHub workflow publishes `herdr-actor` and `herdr-hub` to GHCR for amd64 and arm64.
+  The script takes them through `ACTOR_IMAGE` and `HUB_IMAGE`, by tag or digest. The hub image now takes
+  `kubectl-ate` from `hub/bin/linux-<arch>/`, so one build can cover several platforms.

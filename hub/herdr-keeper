@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""herdr-keeper: makes a suspended actor look like an always-on herdr machine.
+
+The herdr client connects to a saved machine by running
+`ssh <target> '... herdr remote-client-bridge ...'` and speaking its endpoint
+protocol over that process's stdin/stdout. In the hub, a wrapper named `ssh`
+(hub/ssh) runs this keeper instead, for ate-* targets only. The keeper:
+
+  * reaches the actor's herdr-anchor over a real SSH connection and relays
+    herdr frames both ways while the actor is awake;
+  * when hubctl asks it to park, drains and drops that connection so the
+    actor can be suspended, then answers the client's health pings itself;
+    the client keeps showing the machine as online;
+  * holds focus/theme/resize frames while parked, keeping only the latest of
+    each, and wakes the actor on anything else (keystrokes, opening the
+    machine, requests): reconnecting through the router resumes the actor;
+  * replays unacknowledged bytes after every reconnect, so the herdr session
+    on the actor never notices the gap (see actor/herdr-anchor).
+
+It relies only on herdr's frozen endpoint-generation-1 contract:
+[u32 LE length][bincode payload] frames, ClientMessage variant tags, and the
+named EndpointControl health ping/pong. If the bridge command doesn't have the
+expected shape, it falls back to a plain relay and refuses to park.
+
+Control: one Unix socket per keeper in $HERDR_KEEPER_RUN/<machine>/<pid>.sock,
+one JSON request line, one JSON reply line:
+  {"cmd":"status"} | {"cmd":"park","timeout":30} | {"cmd":"wake"}
+"""
+import argparse
+import asyncio
+import json
+import os
+import re
+import secrets
+import signal
+import struct
+import sys
+import time
+
+REAL_SSH = os.environ.get("HERDR_REAL_SSH", "/usr/bin/ssh")
+RUN_DIR = os.environ.get("HERDR_KEEPER_RUN", "/tmp/herdr-keepers")
+WAKE_TIMEOUT = float(os.environ.get("HERDR_KEEPER_WAKE_TIMEOUT", "180"))
+CONNECT_TIMEOUT = float(os.environ.get("HERDR_KEEPER_CONNECT_TIMEOUT", "120"))
+MAX_UNACKED = int(os.environ.get("HERDR_KEEPER_MAX_UNACKED", str(32 * 1024 * 1024)))
+ACK_EVERY = 256 * 1024
+MAX_FRAME = 64 * 1024 * 1024
+
+# Keeper <-> anchor messages (same as actor/herdr-anchor).
+HELLO, WELCOME, DATA, ACK, CLOSE, END = 1, 2, 3, 4, 5, 6
+HEADER = struct.Struct("<BI")
+
+# herdr ClientMessage variant tags (frozen for endpoint generation 1).
+TAG_RESIZE, TAG_DETACH = 3, 4
+TAG_SHELL_RESIZE, TAG_HOST_THEME, TAG_FOCUS, TAG_MOUSE_CAPTURE = 12, 17, 18, 19
+TAG_ENDPOINT_CONTROL = 20
+# State-like messages: only the latest matters, and none of them means a user
+# is using this machine. Held while parked, delivered on the next wake.
+DEFERRABLE = {TAG_RESIZE, TAG_SHELL_RESIZE, TAG_HOST_THEME, TAG_FOCUS, TAG_MOUSE_CAPTURE}
+PING_KIND = b"endpoint.health.ping.v1"
+PONG_KIND = b"endpoint.health.pong.v1"
+MARKER_RE = re.compile(r"printf '\n%s\n' '([^'\n]+)'")
+
+
+# --- bincode (standard config) varints ---------------------------------------
+def varint_decode(buf, pos):
+    first = buf[pos]
+    if first < 251:
+        return first, pos + 1
+    size = {251: 2, 252: 4, 253: 8}.get(first)
+    if size is None:
+        raise ValueError("unsupported varint")
+    return int.from_bytes(buf[pos + 1:pos + 1 + size], "little"), pos + 1 + size
+
+
+def varint_encode(value):
+    if value < 251:
+        return bytes([value])
+    if value < 1 << 16:
+        return b"\xfb" + value.to_bytes(2, "little")
+    if value < 1 << 32:
+        return b"\xfc" + value.to_bytes(4, "little")
+    return b"\xfd" + value.to_bytes(8, "little")
+
+
+def endpoint_control(payload):
+    """(kind, data) of an EndpointControl message, or None."""
+    if not payload or payload[0] != TAG_ENDPOINT_CONTROL:
+        return None
+    try:
+        length, pos = varint_decode(payload, 1)
+        kind = bytes(payload[pos:pos + length])
+        pos += length
+        length, pos = varint_decode(payload, pos)
+        return kind, bytes(payload[pos:pos + length])
+    except (IndexError, ValueError):
+        return None
+
+
+def pong_frame(data):
+    payload = (bytes([TAG_ENDPOINT_CONTROL]) + varint_encode(len(PONG_KIND)) + PONG_KIND
+               + varint_encode(len(data)) + data)
+    return struct.pack("<I", len(payload)) + payload
+
+
+def encode(kind, payload=b""):
+    return HEADER.pack(kind, len(payload)) + payload
+
+
+class Fatal(Exception):
+    pass
+
+
+class NoAnchor(Exception):
+    """The actor's image predates herdr-anchor."""
+
+
+# Remote command for the anchor; exits 97 when the actor has no herdr-anchor.
+ANCHOR_COMMAND = "command -v herdr-anchor >/dev/null 2>&1 || exit 97; exec herdr-anchor attach"
+NO_ANCHOR_EXIT = 97
+
+
+class Keeper:
+    def __init__(self, target, command, ssh_args):
+        self.target = target
+        self.ssh_args = ssh_args          # herdr's original ssh arguments
+        self.plain = None                 # fallback relay process (actor without herdr-anchor)
+        self.machine = target[len("ate-"):] if target.startswith("ate-") else target
+        self.command = command
+        marker = MARKER_RE.search(command)
+        self.preamble = (b"\n" + marker.group(1).encode() + b"\n") if marker else None
+        self.session = secrets.token_urlsafe(24)
+        self.session_open = False       # the anchor has confirmed our session
+        self.state = "connecting"
+        self.started = time.monotonic()
+        self.last_input = self.started
+        self.last_output = self.started
+        # client -> actor
+        self.up_buf = bytearray()
+        self.up_base = 0
+        self.up_total = 0
+        self.held = []                  # wake-class frames waiting for a connection
+        self.deferred = {}              # tag -> latest deferrable frame
+        # actor -> client
+        self.down_total = 0
+        self.down_unacked = 0
+        self.down_pending = bytearray()
+        self.preamble_done = self.preamble is None
+        self.stdout_lock = asyncio.Lock()
+        # upstream
+        self.proc = None
+        self.up_reader = None
+        self.up_writer = None
+        self.reader_task = None
+        self.connected = asyncio.Event()
+        self.wake_task = None
+        self.park_abort = False
+        self.acked_event = asyncio.Event()
+        self.log_file = None
+
+    # --- logging and control -------------------------------------------------
+    def log(self, message):
+        if self.log_file:
+            self.log_file.write(f"{time.strftime('%H:%M:%S')} [{self.state}] {message}\n")
+            self.log_file.flush()
+
+    def status(self):
+        now = time.monotonic()
+        return {
+            "machine": self.machine, "pid": os.getpid(), "state": self.state,
+            "session": self.session[:8], "parkable": self.preamble is not None,
+            "input_idle": round(now - self.last_input, 1),
+            "output_idle": round(now - self.last_output, 1),
+        }
+
+    async def control(self, reader, writer):
+        try:
+            request = json.loads(await reader.readline() or b"{}")
+            cmd = request.get("cmd")
+            if cmd == "status":
+                reply = self.status()
+            elif cmd == "park":
+                reply = {"result": await self.park(float(request.get("timeout", 30)))}
+            elif cmd == "wake":
+                self.wake("hubctl")
+                reply = {"result": self.state}
+            else:
+                reply = {"error": f"unknown command {cmd!r}"}
+        except Exception as error:  # noqa: BLE001
+            reply = {"error": str(error)}
+        writer.write(json.dumps(reply).encode() + b"\n")
+        await writer.drain()
+        writer.close()
+
+    # --- client side -----------------------------------------------------------
+    async def write_client(self, data):
+        async with self.stdout_lock:
+            self.stdout.write(data)
+            await self.stdout.drain()
+
+    async def client_loop(self):
+        """Read frames from the herdr client (our stdin)."""
+        while True:
+            try:
+                header = await self.stdin.readexactly(4)
+            except asyncio.IncompleteReadError:
+                return
+            (length,) = struct.unpack("<I", header)
+            if length > MAX_FRAME:
+                raise Fatal(f"client frame of {length} bytes")
+            payload = await self.stdin.readexactly(length)
+            await self.from_client(header + payload, payload)
+
+    async def from_client(self, frame, payload):
+        if self.plain is not None:
+            self.last_input = time.monotonic()
+            self.plain.stdin.write(frame)
+            await self.plain.stdin.drain()
+            return
+        tag = payload[0] if payload else -1
+        control = endpoint_control(payload)
+        if control and control[0] == PING_KIND:
+            if self.state == "awake":
+                await self.send_up(frame)
+            else:
+                # Parked or reconnecting: answer exactly as the server would.
+                await self.write_client(pong_frame(control[1]))
+            return
+        if self.preamble is None or self.state == "awake":
+            if tag not in DEFERRABLE and tag != TAG_DETACH:
+                self.last_input = time.monotonic()
+            await self.send_up(frame)
+            return
+        if tag == TAG_DETACH:
+            return
+        if tag in DEFERRABLE:
+            self.deferred[tag] = frame
+            return
+        self.last_input = time.monotonic()
+        self.held.append(frame)
+        if self.state == "parking":
+            self.park_abort = True
+        elif self.state == "parked":
+            self.wake("client input")
+
+    async def send_up(self, frame):
+        self.up_buf += frame
+        self.up_total += len(frame)
+        if len(self.up_buf) > MAX_UNACKED:
+            raise Fatal("too much unacknowledged client data")
+        if self.up_writer is not None:
+            try:
+                self.up_writer.write(encode(DATA, frame))
+                await self.up_writer.drain()
+            except (ConnectionError, RuntimeError):
+                self.upstream_lost("write failed")
+
+    # --- actor side ------------------------------------------------------------
+    async def reader_loop(self, reader):
+        try:
+            await self._reader_loop(reader)
+        except Fatal as error:
+            await self.fail(str(error))
+
+    async def _reader_loop(self, reader):
+        try:
+            while True:
+                header = await reader.readexactly(HEADER.size)
+                kind, length = HEADER.unpack(header)
+                payload = await reader.readexactly(length)
+                if kind == DATA:
+                    await self.from_actor(payload)
+                elif kind == ACK:
+                    (acked,) = struct.unpack("<Q", payload)
+                    if self.up_base <= acked <= self.up_total:
+                        del self.up_buf[: acked - self.up_base]
+                        self.up_base = acked
+                    self.acked_event.set()
+                elif kind == END:
+                    reason = json.loads(payload).get("reason", "")
+                    self.log(f"actor ended the session: {reason}")
+                    raise Fatal(f"remote bridge ended: {reason}")
+                else:
+                    raise Fatal(f"unexpected message {kind} from the anchor")
+        except (asyncio.IncompleteReadError, ConnectionError):
+            if reader is self.up_reader:
+                self.upstream_lost("connection closed")
+
+    async def from_actor(self, data):
+        self.down_total += len(data)
+        self.down_unacked += len(data)
+        self.last_output = time.monotonic()
+        if not self.preamble_done:
+            self.down_pending += data
+            end = self.down_pending.find(self.preamble)
+            if end < 0:
+                if len(self.down_pending) > 1 << 20:
+                    raise Fatal("bridge never printed its ready marker")
+                return
+            end += len(self.preamble)
+            await self.write_client(bytes(self.down_pending[:end]))
+            data = bytes(self.down_pending[end:])
+            self.down_pending = bytearray()
+            self.preamble_done = True
+        if self.preamble is None:
+            await self.write_client(data)
+        else:
+            # Forward whole frames only, so a local pong never lands mid-frame.
+            self.down_pending += data
+            while len(self.down_pending) >= 4:
+                (length,) = struct.unpack_from("<I", self.down_pending)
+                if len(self.down_pending) < 4 + length:
+                    break
+                frame = bytes(self.down_pending[:4 + length])
+                del self.down_pending[:4 + length]
+                await self.write_client(frame)
+        if self.down_unacked >= ACK_EVERY:
+            await self.send_ack()
+
+    async def send_ack(self):
+        self.down_unacked = 0
+        if self.up_writer is not None:
+            try:
+                self.up_writer.write(encode(ACK, struct.pack("<Q", self.down_total)))
+                await self.up_writer.drain()
+            except (ConnectionError, RuntimeError):
+                self.upstream_lost("ack failed")
+
+    # --- connection management ---------------------------------------------
+    def upstream_lost(self, why):
+        if self.up_writer is None:
+            return
+        self.log(f"upstream lost: {why}")
+        self.drop_upstream()
+        self.acked_event.set()
+        if self.state == "parking":
+            self.park_abort = True      # park() notices and reconnects
+        elif self.state == "awake":
+            self.wake("connection lost")
+
+    def drop_upstream(self):
+        self.connected.clear()
+        if self.up_writer is not None:
+            try:
+                self.up_writer.close()
+            except RuntimeError:
+                pass
+        self.up_writer = None
+        self.up_reader = None
+        if self.proc is not None and self.proc.returncode is None:
+            try:
+                self.proc.terminate()
+            except ProcessLookupError:
+                pass
+        self.proc = None
+
+    async def open_upstream(self, resume):
+        argv = [REAL_SSH, "-F", os.path.join(os.environ.get("HOME", "/"), ".ssh", "config"),
+                "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+                "-o", "ConnectTimeout=90", "-T", self.target, ANCHOR_COMMAND]
+        err = open(os.path.join(self.dir, f"{os.getpid()}.ssh.log"), "ab")
+        self.proc = await asyncio.create_subprocess_exec(
+            *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=err,
+            env={**os.environ, "HERDR_KEEPER_BYPASS": "1"})
+        err.close()
+        reader, writer = self.proc.stdout, self.proc.stdin
+        hello = {"v": 1, "session": self.session, "recv": self.down_total,
+                 "cmd": None if resume else self.command}
+        writer.write(encode(HELLO, json.dumps(hello).encode()))
+        try:
+            await writer.drain()
+            header = await reader.readexactly(HEADER.size)
+        except (asyncio.IncompleteReadError, ConnectionError):
+            if await self.proc.wait() == NO_ANCHOR_EXIT:
+                raise NoAnchor() from None
+            raise
+        kind, length = HEADER.unpack(header)
+        payload = await reader.readexactly(length)
+        if kind != WELCOME:
+            raise ConnectionError(f"expected WELCOME, got {kind}")
+        welcome = json.loads(payload)
+        if welcome["status"] == "unknown":
+            raise Fatal("the actor no longer has this session (restarted or reverted)")
+        recv = int(welcome["recv"])
+        if not self.up_base <= recv <= self.up_total:
+            raise Fatal(f"anchor position {recv} outside {self.up_base}..{self.up_total}")
+        del self.up_buf[: recv - self.up_base]
+        self.up_base = recv
+        self.session_open = True
+        self.up_reader, self.up_writer = reader, writer
+        if self.up_buf:
+            writer.write(encode(DATA, bytes(self.up_buf)))
+        await writer.drain()
+        self.log(f"connected ({welcome['status']}; replayed {len(self.up_buf)} bytes)")
+        self.reader_task = asyncio.create_task(self.reader_loop(reader))
+        self.connected.set()
+
+    def wake(self, why):
+        if self.wake_task is not None or self.state == "parking":
+            return
+        if self.state == "awake" and self.up_writer is not None:
+            return
+        self.log(f"waking: {why}")
+        if self.state != "connecting":
+            self.state = "waking"
+        self.wake_task = asyncio.create_task(self.connect_loop())
+
+    async def connect_loop(self):
+        deadline = time.monotonic() + (WAKE_TIMEOUT if self.session_open else CONNECT_TIMEOUT)
+        delay = 1.0
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(self.open_upstream(self.session_open),
+                                           max(1.0, deadline - time.monotonic()))
+                    break
+                except Fatal:
+                    raise
+                except NoAnchor:
+                    self.drop_upstream()
+                    if self.session_open:
+                        raise Fatal("herdr-anchor disappeared from the actor") from None
+                    await self.start_plain()
+                    return
+                except (OSError, ConnectionError, asyncio.IncompleteReadError,
+                        asyncio.TimeoutError, ValueError) as error:
+                    self.drop_upstream()
+                    if time.monotonic() + delay >= deadline:
+                        raise Fatal(f"could not reach the actor: {error}") from error
+                    self.log(f"connect failed ({error!r}); retrying in {delay:.0f}s")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 10.0)
+            self.state = "awake"
+            # Deliver what arrived while we were away: state first, then input.
+            for tag in sorted(self.deferred):
+                await self.send_up(self.deferred[tag])
+            self.deferred.clear()
+            held, self.held = self.held, []
+            for frame in held:
+                await self.send_up(frame)
+        except Fatal as error:
+            await self.fail(str(error))
+        finally:
+            self.wake_task = None
+
+
+    # --- fallback: actor without herdr-anchor ------------------------------
+    async def start_plain(self):
+        """Relay herdr's own ssh bridge byte for byte. Works like plain herdr:
+        the machine can't be parked, so hubctl won't suspend it under a client."""
+        self.log("actor has no herdr-anchor (older image): plain relay, not parkable")
+        self.preamble = None
+        err = open(os.path.join(self.dir, f"{os.getpid()}.ssh.log"), "ab")
+        self.plain = await asyncio.create_subprocess_exec(
+            REAL_SSH, *self.ssh_args, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=err,
+            env={**os.environ, "HERDR_KEEPER_BYPASS": "1"})
+        err.close()
+        pending = [self.deferred[t] for t in sorted(self.deferred)] + self.held
+        self.deferred, self.held = {}, []
+        for frame in pending:
+            self.plain.stdin.write(frame)
+        await self.plain.stdin.drain()
+        self.state = "awake"
+        asyncio.create_task(self.plain_down())
+
+    async def plain_down(self):
+        while True:
+            chunk = await self.plain.stdout.read(65536)
+            if not chunk:
+                break
+            self.last_output = time.monotonic()
+            await self.write_client(chunk)
+        code = await self.plain.wait()
+        self.log(f"plain relay ended (ssh exited {code})")
+        os._exit(code if code else 255)
+
+    async def park(self, timeout):
+        if self.preamble is None:
+            return "unsupported"
+        if self.state == "parked":
+            return "parked"
+        if self.state != "awake" or self.up_writer is None:
+            return "busy"
+        self.state = "parking"
+        self.park_abort = False
+        deadline = time.monotonic() + timeout
+        try:
+            # 1. Everything we sent has reached the actor.
+            while self.up_base < self.up_total:
+                self.acked_event.clear()
+                await self.send_ack()
+                await asyncio.wait_for(self.acked_event.wait(), max(0.1, deadline - time.monotonic()))
+                if self.park_abort:
+                    return self.unpark("input while parking")
+            # 2. The actor has gone quiet, and we're on a frame boundary.
+            while (time.monotonic() - self.last_output < 1.0 or self.down_pending
+                   or not self.preamble_done):
+                if self.park_abort:
+                    return self.unpark("input while parking")
+                if time.monotonic() > deadline:
+                    return self.unpark("actor kept sending")
+                await asyncio.sleep(0.2)
+            if self.park_abort:
+                return self.unpark("input while parking")
+            await self.send_ack()
+        except asyncio.TimeoutError:
+            return self.unpark("timed out waiting for acknowledgements")
+        self.state = "parked"
+        self.drop_upstream()
+        self.log("parked")
+        return "parked"
+
+    def unpark(self, why):
+        self.log(f"park aborted: {why}")
+        if self.up_writer is None:
+            # The connection went away while parking; the reconnect delivers
+            # whatever was held back.
+            self.state = "waking"
+            self.wake(why)
+            return "busy"
+        self.state = "awake"
+        held, self.held = self.held, []
+        deferred, self.deferred = self.deferred, {}
+
+        async def flush():
+            try:
+                for frame in [deferred[t] for t in sorted(deferred)] + held:
+                    await self.send_up(frame)
+            except Fatal as error:
+                await self.fail(str(error))
+        asyncio.create_task(flush())
+        return "busy"
+
+    async def fail(self, why):
+        self.log(f"giving up: {why}")
+        try:
+            sys.stderr.write(f"herdr-keeper: {why}\n")
+            sys.stderr.flush()
+        except OSError:
+            pass
+        os._exit(255)
+
+    # --- main --------------------------------------------------------------------
+    async def run(self):
+        self.dir = os.path.join(RUN_DIR, self.machine)
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        self.log_file = open(os.path.join(self.dir, f"{os.getpid()}.log"), "a")
+        sock_path = os.path.join(self.dir, f"{os.getpid()}.sock")
+        loop = asyncio.get_running_loop()
+        self.stdin = asyncio.StreamReader(limit=MAX_FRAME)
+        await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(self.stdin), sys.stdin)
+        transport, protocol = await loop.connect_write_pipe(
+            asyncio.streams.FlowControlMixin, sys.stdout)
+        self.stdout = asyncio.StreamWriter(transport, protocol, None, loop)
+        self.log(f"keeper for {self.target} (session {self.session[:8]}, "
+                 f"{'parkable' if self.preamble else 'plain relay: unexpected bridge command'})")
+        server = await asyncio.start_unix_server(self.control, path=sock_path)
+        try:
+            self.wake("start")
+            await self.client_loop()
+            self.log("client went away")
+            if self.up_writer is not None and self.state == "awake":
+                try:
+                    self.up_writer.write(encode(CLOSE))
+                    await self.up_writer.drain()
+                except (ConnectionError, RuntimeError):
+                    pass
+        except Fatal as error:
+            await self.fail(str(error))
+        finally:
+            server.close()
+            self.drop_upstream()
+            for path in (sock_path,):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--command", required=True)
+    parser.add_argument("ssh_args", nargs=argparse.REMAINDER,
+                        help="after --: herdr's original ssh arguments, for actors without herdr-anchor")
+    args = parser.parse_args()
+    ssh_args = args.ssh_args[1:] if args.ssh_args[:1] == ["--"] else args.ssh_args
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    keeper = Keeper(args.target, args.command, ssh_args)
+    asyncio.run(keeper.run())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

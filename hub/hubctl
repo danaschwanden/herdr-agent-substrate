@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # hubctl: actor lifecycle from inside the herdr hub pod.
 #
-# The hub owns both halves of the lifecycle, which is why this runs here:
-#   - herdr's saved-machine list (an enabled machine is reconnected by any
-#     open herdr client, and each reconnect resumes a suspended actor);
-#   - the right to suspend/resume actors (atespace editor via ate-api).
+# Every actor's herdr machine stays enabled and looks online all the time.
+# Suspending is invisible to the herdr client because herdr-keeper sits
+# between the client and each actor (see hub/herdr-keeper, actor/herdr-anchor):
+#   suspend: park the keepers (they drain, drop their connection and answer
+#            the client's health pings themselves), cut leftover tunnels,
+#            then suspend the actor;
+#   resume:  happens by itself on the next keystroke or request: the keeper
+#            reconnects through the router, which resumes the actor.
 set -euo pipefail
 
 : "${ATESPACE:?ATESPACE is not set}"
@@ -12,8 +16,12 @@ ATE_API_ENDPOINT="${ATE_API_ENDPOINT:-api.ate-system.svc:443}"
 ATE_API_TOKEN="${ATE_API_TOKEN:-/var/run/ate/api-token/token}"
 IDLE_SECONDS="${IDLE_SECONDS:-300}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
+KEEPER_RUN="${HERDR_KEEPER_RUN:-/tmp/herdr-keepers}"
 STATE_DIR="${HOME}/.herdr-hub"
 mkdir -p "${STATE_DIR}"
+# hubctl's own ssh and herdr --machine calls go straight to the actor, never
+# through a keeper: they must not count as user activity.
+export HERDR_KEEPER_BYPASS=1
 
 log()  { printf '[hubctl] %s\n' "$*" >&2; }
 die()  { log "error: $*"; exit 1; }
@@ -34,12 +42,58 @@ print(rows[0]["id"] if rows else "")' "$1"
 
 cut_tunnel() { pkill -f -- "ate-target-actor: ${ATESPACE}/$1\$" 2>/dev/null || true; }
 
+# keepers NAME REQUEST: send a JSON request to every keeper of machine NAME,
+# print one JSON reply per line. Sockets of keepers that are gone are removed.
+keepers() {
+  python3 - "${KEEPER_RUN}/$1" "$2" <<'PY'
+import glob, json, os, socket, sys
+directory, request = sys.argv[1], sys.argv[2]
+timeout = float(json.loads(request).get("timeout", 5)) + 10
+for path in sorted(glob.glob(os.path.join(directory, "*.sock"))):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+        sock.sendall(request.encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        print(data.decode().strip() or json.dumps({"error": "no reply", "socket": path}))
+    except (ConnectionRefusedError, FileNotFoundError):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    except OSError as error:
+        print(json.dumps({"error": str(error), "socket": path}))
+    finally:
+        sock.close()
+PY
+}
+
+# actor_states: "<name> <state>" for every actor in the atespace.
+actor_states() {
+  ate get actors -a "${ATESPACE}" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit()
+for actor in data.get("actors", []):
+    print(actor["metadata"]["name"], actor.get("status", {}).get("state", "UNKNOWN"))'
+}
+
 cmd_add() {
   local name="${1:?usage: hubctl add <actor>}"; validate_name "${name}"
   log "first SSH contact with ate-${name} (resumes the actor if suspended)"
   # -F: OpenSSH finds ~/.ssh/config through the password database, not $HOME.
   ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-${name}" 'herdr --version' >/dev/null \
     || die "ssh ate-${name} failed; try: ssh -F ~/.ssh/config -vvv ate-${name} true"
+  ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-${name}" 'test -x /usr/local/bin/herdr-anchor' \
+    || log "WARNING: actor ${name} has no herdr-anchor (older image): it can't be suspended while a client is attached"
   if [[ -n "$(machine_id "${name}")" ]]; then
     log "machine ${name} already saved"
   else
@@ -52,29 +106,44 @@ cmd_remove() {
   id="$(machine_id "${name}")"
   if [[ -n "${id}" ]]; then herdr machine remove "${id}" >/dev/null; fi
   cut_tunnel "${name}"
-  rm -f "${STATE_DIR}/last-busy.${name}"
+  rm -f "${STATE_DIR}/last-active.${name}"
 }
 
+# suspend NAME [--force]: park NAME's keepers, then suspend the actor. Without
+# --force, a keeper that sees user input (or can't park) cancels the suspend.
 cmd_suspend() {
-  local name="${1:?usage: hubctl suspend <actor>}" id
-  id="$(machine_id "${name}")"
-  # 1. No client may reconnect: each reconnect would resume the actor.
-  if [[ -n "${id}" ]]; then herdr machine disable "${id}" >/dev/null; fi
-  # 2. Drop the live tunnel instead of waiting out ControlPersist (600 s).
+  local name="${1:?usage: hubctl suspend <actor> [--force]}" force="${2:-}" replies refused
+  replies="$(keepers "${name}" '{"cmd":"park","timeout":30}')"
+  refused="$(python3 -c '
+import json, sys
+bad = []
+for line in sys.stdin.read().splitlines():
+    try:
+        reply = json.loads(line)
+    except ValueError:
+        bad.append(line); continue
+    if reply.get("result") != "parked":
+        bad.append(reply.get("result") or reply.get("error") or line)
+print(", ".join(bad))' <<<"${replies}")"
+  if [[ -n "${refused}" && "${force}" != --force ]]; then
+    log "${name}: not suspending, keeper reported: ${refused}"
+    return 3
+  fi
+  # herdr's own SSH master (probes, --machine calls) keeps sending keepalives
+  # for up to 10 minutes; parked keepers have no connection left to cut.
   cut_tunnel "${name}"
-  # 3. Snapshot and free the worker.
   log "suspending ${ATESPACE}/${name}"
   ate suspend actor "${name}" -a "${ATESPACE}"
-  rm -f "${STATE_DIR}/last-busy.${name}"
+  rm -f "${STATE_DIR}/last-active.${name}"
 }
 
 cmd_resume() {
-  local name="${1:?usage: hubctl resume <actor>}" id
+  local name="${1:?usage: hubctl resume <actor>}"
   log "resuming ${ATESPACE}/${name}"
   ate resume actor "${name}" -a "${ATESPACE}"
-  id="$(machine_id "${name}")"
-  if [[ -n "${id}" ]]; then herdr machine enable "${id}" >/dev/null; fi
-  date +%s >"${STATE_DIR}/last-busy.${name}"
+  # Attached clients: reconnect now rather than on the next keystroke.
+  keepers "${name}" '{"cmd":"wake"}' >/dev/null
+  date +%s >"${STATE_DIR}/last-active.${name}"
 }
 
 # agents_busy LABEL: prints busy, idle or unknown.
@@ -88,31 +157,66 @@ except Exception:
 print("busy" if any(a.get("agent_status") in ("working", "blocked") for a in agents) else "idle")'
 }
 
-# One pass of the idle bridge over every enabled actor machine.
-idle_pass() {
-  local label state marker now
-  now="$(date +%s)"
-  for label in $(herdr machine list --json | python3 -c '
+# input_idle LABEL: seconds since anyone typed into or opened LABEL in an
+# attached herdr client (the smallest across keepers); empty if none attached.
+input_idle() {
+  keepers "$1" '{"cmd":"status"}' | python3 -c '
+import json, sys
+idle = [json.loads(l).get("input_idle") for l in sys.stdin.read().splitlines() if l.strip()]
+idle = [i for i in idle if isinstance(i, (int, float))]
+print(int(min(idle)) if idle else "")'
+}
+
+# Machines saved before the always-on keeper were disabled while suspended.
+enable_all() {
+  local id
+  for id in $(herdr machine list --json | python3 -c '
 import json, sys
 for r in json.load(sys.stdin):
-    if r["enabled"] and r["target"].startswith("ate-"):
+    if not r["enabled"] and r["target"].startswith("ate-"):
+        print(r["id"])'); do
+    herdr machine enable "${id}" >/dev/null && log "re-enabled machine ${id}"
+  done
+}
+
+# One pass of the idle bridge. Only RUNNING actors are looked at: polling a
+# suspended one would resume it.
+idle_pass() {
+  local now name state marker idle last
+  now="$(date +%s)"
+  declare -A states=()
+  while read -r name state; do
+    [[ -n "${name}" ]] && states["${name}"]="${state}"
+  done < <(actor_states)
+  for name in $(herdr machine list --json | python3 -c '
+import json, sys
+for r in json.load(sys.stdin):
+    if r["target"].startswith("ate-"):
         print(r["label"])'); do
-    marker="${STATE_DIR}/last-busy.${label}"
-    state="$(agents_busy "${label}")"
-    case "${state}" in
+    marker="${STATE_DIR}/last-active.${name}"
+    if [[ "${states[${name}]:-}" != ACTOR_STATE_RUNNING ]]; then
+      rm -f "${marker}"
+      continue
+    fi
+    [[ -f "${marker}" ]] || echo "${now}" >"${marker}"
+    idle="$(input_idle "${name}")"
+    if [[ -n "${idle}" ]] && (( idle < IDLE_SECONDS )); then
+      echo "$(( now - idle ))" >"${marker}"
+    fi
+    case "$(agents_busy "${name}")" in
       busy|unknown) echo "${now}" >"${marker}" ;;
-      idle)
-        [[ -f "${marker}" ]] || echo "${now}" >"${marker}"
-        if (( now - $(cat "${marker}") >= IDLE_SECONDS )); then
-          log "${label}: no working/blocked agent for ${IDLE_SECONDS}s"
-          cmd_suspend "${label}" || log "suspend of ${label} failed"
-        fi ;;
     esac
+    last="$(cat "${marker}")"
+    if (( now - last >= IDLE_SECONDS )); then
+      log "${name}: no working/blocked agent and no input for ${IDLE_SECONDS}s"
+      cmd_suspend "${name}" || true
+    fi
   done
 }
 
 cmd_idle_watch() {
-  log "idle bridge: suspend actors after ${IDLE_SECONDS}s without working/blocked agents"
+  log "idle bridge: suspend actors after ${IDLE_SECONDS}s without working/blocked agents or input"
+  enable_all || true
   while :; do
     idle_pass || log "idle pass failed"
     sleep "${POLL_SECONDS}"
@@ -123,21 +227,34 @@ cmd_status() {
   ate get actors -a "${ATESPACE}" || true
   echo
   herdr machine list || true
+  local name
+  for name in $(herdr machine list --json 2>/dev/null | python3 -c '
+import json, sys
+for r in json.load(sys.stdin):
+    if r["target"].startswith("ate-"):
+        print(r["label"])'); do
+    keepers "${name}" '{"cmd":"status"}' | python3 -c '
+import json, sys
+for line in sys.stdin.read().splitlines():
+    s = json.loads(line)
+    if "state" in s:
+        print("keeper {machine} (pid {pid}): {state}, input idle {input_idle}s".format(**s))'
+  done
 }
 
 usage() {
   cat <<EOF
 Usage: hubctl <command> [args]   (atespace: ${ATESPACE})
 
-  add <actor>       pin the actor's host key and save it as herdr machine <actor>
-  remove <actor>    forget the herdr machine
-  suspend <actor>   disable the machine, cut its tunnel, suspend the actor
-  resume <actor>    resume the actor, re-enable the machine
-  idle-watch        loop: suspend actors idle for IDLE_SECONDS (runs as a service)
-  idle-pass         one iteration of idle-watch
-  status            actors and herdr machines
-  ate <args...>     kubectl-ate with the hub's endpoint and token
-  pubkey            the hub's SSH public key (goes into the ActorTemplate)
+  add <actor>              pin the actor's host key and save it as herdr machine <actor>
+  remove <actor>           forget the herdr machine
+  suspend <actor> [--force] park attached clients' keepers, cut tunnels, suspend the actor
+  resume <actor>           resume the actor and reconnect attached clients' keepers
+  idle-watch               loop: suspend actors idle for IDLE_SECONDS (runs as a service)
+  idle-pass                one iteration of idle-watch
+  status                   actors, herdr machines and keepers
+  ate <args...>            kubectl-ate with the hub's endpoint and token
+  pubkey                   the hub's SSH public key (goes into the ActorTemplate)
 EOF
 }
 

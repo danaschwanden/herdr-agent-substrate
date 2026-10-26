@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Actor entrypoint: runs three supervised services and never exits.
+# Actor entrypoint: runs four supervised services and never exits.
 #
 #   websocat :80  ->  sshd 127.0.0.1:2222  ->  herdr server (owns the agent PTYs)
+#   herdr-anchor: keeps the hub's client sessions to that server across suspends
 #
 # Everything here is captured by substrate's MEMORY snapshots, so after a
 # suspend/resume the herdr server and any running agents come back as they were.
@@ -67,6 +68,10 @@ supervise sshd /usr/sbin/sshd -D -e &
 # is not a detached daemon (getsid(0) == getpid()). `setsid --wait` gives it
 # a new session while keeping it in the foreground for the supervisor.
 supervise herdr bash -c 'cd /work && exec setsid --wait herdr server' &
+
+# Holds the hub's herdr client sessions across suspends: the bridge to the
+# herdr server lives here, in the memory snapshot, while the hub is parked.
+supervise herdr-anchor bash -c 'cd /work && exec herdr-anchor serve' &
 
 # WebSocket -> SSH. Fixed target: this is not a general-purpose proxy.
 # Pings keep idle tunnels alive through the router and kubectl port-forward,

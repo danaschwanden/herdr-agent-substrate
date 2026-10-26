@@ -66,11 +66,11 @@ flowchart TB
     end
     podcert["podcertificate-controller<br/>issues pod identities"]
     subgraph hubns["herdr-hub"]
-      hub["hub pod<br/>herdr client, hubctl idle-watch,<br/>ate-wss-proxy, SSH key on PVC"]
+      hub["hub pod<br/>herdr client, a herdr-keeper per machine,<br/>hubctl idle-watch, ate-wss-proxy, SSH key on PVC"]
     end
     subgraph agents["herdr-agents: WorkerPool"]
       subgraph worker["worker pod"]
-        actor["actor in a gVisor sandbox<br/>websocat :80, sshd, herdr server,<br/>claude in panes"]
+        actor["actor in a gVisor sandbox<br/>websocat :80, sshd, herdr-anchor, herdr server,<br/>claude in panes"]
       end
     end
     secret[("Secret anthropic<br/>herdr-agents-secrets")]
@@ -100,9 +100,11 @@ flowchart TB
   cluster pulls from.
 - **ate-system** is substrate's control plane: the API (state in postgres), the router (the only way into an actor),
   the egress gateway (the only way out), atelet (snapshots, stored in rustfs) and the credential provider.
-- **The hub** is an ordinary pod: the herdr client for every actor and the lifecycle controller.
+- **The hub** is an ordinary pod: the herdr client for every actor and the lifecycle controller. A
+  `herdr-keeper` carries each of the client's machine connections, so a suspended actor still looks online
+  ([Always-on machines](#always-on-machines)).
 - **Each actor** runs in a gVisor sandbox on a worker pod: a herdr server behind sshd behind websocat, with Claude
-  Code in its panes. Its only egress is `api.anthropic.com`, and the real API key is added on the way out.
+  Code in its panes. Its `herdr-anchor` holds the hub's session to that server across suspends. Its only egress is `api.anthropic.com`, and the real API key is added on the way out.
 
 Built against herdr **0.9.5**. The quick start tracks substrate's `main` and was tested at commit **4ebd668**
 (2026-10-23); the production guides pin substrate release **v0.6.0**.
@@ -305,8 +307,9 @@ Detach with `ctrl+b` then `q`. Claude and the actor keep running.
 
 ### 14. Suspend and resume
 
-The hub suspends an actor automatically after 5 minutes (`IDLE_SECONDS`) with no working or blocked agent,
-including an actor with no agents at all. To do it by hand:
+The hub suspends an actor after 5 minutes (`IDLE_SECONDS`) with no working or blocked agent and no input,
+even while herdr is attached, and herdr keeps showing the machine online. To see it without waiting, keep herdr
+attached in one terminal (step 13). In a second terminal, from the kit's directory:
 
 ```bash
 host/herdr-substrate.sh suspend luna
@@ -316,19 +319,16 @@ host/herdr-substrate.sh suspend luna
 host/herdr-substrate.sh status
 ```
 
-`luna` is now `ACTOR_STATE_SUSPENDED` with no worker pod, and its herdr machine is `disabled`. Its memory,
-including the running Claude session, is in a snapshot.
+`luna` is now `ACTOR_STATE_SUSPENDED` with no worker pod. Its memory, including the running Claude session, is in
+a snapshot. The herdr machine is still `enabled`, and the keeper line reads `keeper luna (…): parked`. In the
+herdr terminal, luna still shows `●`, online.
 
-```bash
-host/herdr-substrate.sh resume luna
-```
+Now type into a pane on luna. The keystroke wakes it: the keeper reconnects, the router resumes the actor, and the
+keystroke arrives a moment later in the same session, with Claude where you left it. `status` shows it
+`ACTOR_STATE_RUNNING` and the keeper `awake` again. To wake an actor without typing, run
+`host/herdr-substrate.sh resume luna`.
 
-```bash
-host/herdr-substrate.sh attach
-```
-
-`luna` is running and enabled again, and the Claude session is where you left it. To watch the hub's
-automatic decisions (Ctrl-C to stop):
+To watch the hub's automatic decisions (Ctrl-C to stop):
 
 ```bash
 host/herdr-substrate.sh logs
@@ -415,7 +415,7 @@ sequenceDiagram
   rect rgba(128,128,128,0.08)
   Note over U,M: attach, then claude in a pane
   U->>H: attach: herdr TUI in the hub
-  H->>X: herdr session over the same SSH path
+  H->>X: herdr session: keeper, SSH over path 3, anchor, herdr server
   X->>X: pane runs claude, onboarding pre-completed
   X->>X: DNS relay resolves api.anthropic.com, allowed by policy
   X->>E: HTTPS, x-api-key placeholder
@@ -428,11 +428,20 @@ sequenceDiagram
   end
 
   rect rgba(128,128,128,0.08)
-  Note over H,W: 5 minutes without a working or blocked agent
-  H->>H: idle-watch: herdr machine disable luna, kill tunnel
+  Note over H,W: 5 minutes without a working or blocked agent or input
+  H->>H: idle-watch parks luna's keeper: it drops the SSH session<br/>and answers herdr's health checks itself
   H->>A: SuspendActor luna
   A->>W: checkpoint memory to a snapshot, free the worker
-  A-->>H: SUSPENDED
+  A-->>H: SUSPENDED, while herdr still shows luna online
+  end
+
+  rect rgba(128,128,128,0.08)
+  Note over U,X: next keystroke on luna
+  U->>H: keystroke in a pane on luna
+  H->>R: keeper reconnects, path 3
+  R->>A: ResumeActor luna, request held meanwhile
+  A->>W: restore luna's own snapshot
+  H->>X: anchor resumes the session, the keystroke arrives
   end
 ```
 
@@ -444,9 +453,10 @@ sequenceDiagram
 - **First Claude request (17–27).** The actor can resolve and reach only `api.anthropic.com`. The egress gateway
   terminates its TLS (the actor trusts the gateway's CA), looks up the credential the egress policy names, and
   replaces the placeholder `x-api-key` with the real one.
-- **Back to sleep (28–31).** After `IDLE_SECONDS` without a working or blocked agent, the hub disables the machine
-  first, so no client reconnects and wakes it, then suspends it. The next resume restores this actor's own
-  snapshot, with its Claude session intact.
+- **Back to sleep (28–31).** After `IDLE_SECONDS` without a working or blocked agent or any input, the hub parks
+  the keeper and suspends the actor. herdr keeps showing it online: the keeper answers its health checks.
+- **Wake on demand (32–36).** Input on luna makes the keeper reconnect, and the router resumes the actor from its
+  own snapshot. The anchor never lost the session, so the keystroke simply arrives a moment later.
 
 ### Two roles, two lifecycles
 
@@ -455,8 +465,8 @@ sequenceDiagram
 | Runs as | substrate actor, gVisor sandbox | ordinary Kubernetes Deployment, 1 replica |
 | Count | many; fewer workers than actors | one |
 | Busy when | an agent is working | always, but tiny: a 30 s poll loop |
-| Sleeps | suspended after `IDLE_SECONDS` with no working or blocked agent | doesn't; scale it to 0 if you like, its state is on its volume |
-| Wakes | next connection through the router, or `resume` | `attach` / `kubectl exec` |
+| Sleeps | suspended after `IDLE_SECONDS` with no working or blocked agent and no input, even with a client attached | doesn't; scale it to 0 if you like, its state is on its volume |
+| Wakes | input or a request from a herdr client, any other connection through the router, or `resume` | `attach` / `kubectl exec` |
 | State | agent sessions, in memory snapshots | herdr machine list, SSH key, known_hosts, idle timers (1 GiB PVC) |
 | Holds | nothing privileged; a placeholder API key | the SSH key to every actor, atespace editor on ate-api, a router identity |
 
@@ -470,57 +480,109 @@ sequenceDiagram
 - **The router admits only allowlisted identities.** The Envoy router requires `--ingress-allowed-spiffe-ids` and
   accepts only clients with an mTLS certificate carrying an allowlisted SPIFFE ID. A pod gets one from substrate's
   pod-identity signer; a laptop with a port-forward has none.
-- **The lifecycles are coupled through the client.** An enabled herdr machine is reconnected by any open client,
-  and every reconnect resumes its actor. So whatever owns the machine list must also be what suspends actors. In
-  the hub, `hubctl` does both.
+- **The lifecycles are coupled through the client.** An attached herdr client keeps every machine connected, and
+  any connection through the router resumes its actor. So whatever suspends actors must also control the client's
+  connections. In the hub, `hubctl` parks the keepers that carry them before it suspends.
 
 ### Lifecycle
 
-`hubctl idle-watch` runs as a service in the hub. Every `POLL_SECONDS` it asks each *enabled* actor machine for
-its agents (`herdr --machine <actor> agent list`). An actor with no `working` or `blocked` agent for
-`IDLE_SECONDS` is suspended:
+`hubctl idle-watch` runs as a service in the hub. Every `POLL_SECONDS` it looks at the actors substrate reports
+as running, never at suspended ones, since polling would wake them. For each one it asks two questions:
 
-1. `herdr machine disable`: no client may reconnect, since each reconnect would resume the actor.
-2. The actor's websocat tunnel is killed; herdr's SSH master would otherwise linger (`ControlPersist=600`).
-3. `kubectl-ate suspend actor`, as `system:serviceaccount:herdr-hub:herdr-hub` (atespace editor).
+- **Agents:** any agent `working` or `blocked`? It asks with `herdr --machine <actor> agent list`.
+- **Input:** has anyone typed into, or opened, the machine in an attached herdr client? The keepers report this.
 
-`resume <actor>` resumes explicitly and re-enables the machine. Suspended machines are skipped by the idle bridge
-and refused by `herdr --machine`, so nothing in the hub wakes an actor except an explicit resume.
+An actor with neither for `IDLE_SECONDS` is suspended:
+
+1. Its keepers park. Each one waits until everything it sent is acknowledged and the actor has gone quiet, then
+   drops its SSH session. Input arriving meanwhile cancels the suspend.
+2. Leftover tunnels are cut. herdr's own SSH master, used for its probes, would otherwise keep sending keepalives
+   for up to 10 minutes (`ControlPersist=600`).
+3. `kubectl-ate suspend actor` runs, as `system:serviceaccount:herdr-hub:herdr-hub` (atespace editor).
+
+Nothing needs resuming by hand: the next keystroke or request in a client wakes the actor. `resume <actor>` still
+wakes one explicitly, and reconnects attached clients straight away.
+
+### Always-on machines
+
+herdr's client pings every connected machine after 5 seconds of quiet, and gives up after 10 more. A suspended
+actor can't answer, so a plain connection would show the machine as reconnecting, and every reconnect would wake
+the actor. Two small programs keep the connection's other end alive instead:
+
+- **`herdr-keeper`, in the hub.** herdr starts `ssh <machine> '… herdr remote-client-bridge'` for each saved
+  machine. In the hub, `ssh` is a wrapper that hands those bridges, for `ate-*` machines only, to a keeper.
+  - **Awake:** the keeper relays herdr's frames over a real SSH session.
+  - **Parked:** it answers herdr's health pings itself, so the machine stays online.
+  - **Held frames:** focus, theme and resize frames wait for the next wake, latest only.
+  - **Waking:** anything else, such as a keystroke, opening the machine, or a request, wakes the actor by
+    reconnecting through the router.
+- **`herdr-anchor`, in the actor.** It runs the bridge to the herdr server and keeps it while the SSH session is
+  gone. The anchor, the bridge and their connection to the server are all in the actor's memory snapshot, so after
+  a resume they carry on. Both sides then replay what the other hasn't received, so the herdr server never sees a
+  disconnect.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as herdr client
+  participant K as herdr-keeper (hub)
+  participant R as atenet-router
+  participant N as herdr-anchor (actor)
+  participant V as herdr server (actor)
+  rect rgba(128,128,128,0.08)
+  Note over C,V: awake
+  C->>K: frames: input, health pings
+  K->>N: over SSH, path 3
+  N->>V: through the bridge
+  V-->>C: screen updates, pongs, the same way back
+  end
+  rect rgba(128,128,128,0.08)
+  Note over C,V: parked, actor suspended
+  C->>K: health ping
+  K-->>C: pong, answered by the keeper
+  C->>K: focus, theme or resize
+  K->>K: held, latest only
+  end
+  rect rgba(128,128,128,0.08)
+  Note over C,V: input wakes it
+  C->>K: keystroke
+  K->>R: new SSH session: the router resumes the actor
+  K->>N: resume session, replay unacknowledged bytes
+  N->>V: held frames, then the keystroke
+  V-->>C: output, same session as before
+  end
+```
+
+The keeper depends only on herdr's endpoint protocol, which herdr's source declares a stable contract: length-prefixed
+frames, frozen message tags, and a named health ping and pong. If the bridge command doesn't look as expected, or
+the actor's image has no `herdr-anchor`, the keeper relays plainly and refuses to park. That machine then works
+like plain herdr, and hubctl won't suspend its actor while a client is attached.
 
 
 #### Actor states
 
-An actor's substrate state and its herdr machine's state move together; the hub keeps them in step.
+The herdr machine stays enabled and shows online in every state; only substrate's state changes.
 
 ```mermaid
 stateDiagram-v2
-  state "SUSPENDED, no herdr machine" as S0
-  state "RUNNING, no herdr machine" as R0
-  state "RUNNING, machine enabled" as RE
-  state "SUSPENDED, machine disabled" as SD
-  state "RUNNING, machine disabled" as RD
+  state "SUSPENDED, not yet a herdr machine" as S0
+  state "RUNNING, machine online" as R
+  state "SUSPENDED, machine still shows online" as S
 
   [*] --> S0: actor NAME
-  S0 --> R0: machine NAME, first ssh
-  R0 --> RE: herdr machine add
-  RE --> SD: idle or suspend NAME
-  SD --> RE: resume NAME
-  SD --> RD: router connection
-  RD --> RE: resume NAME
-  RD --> SD: suspend NAME
-  RE --> [*]: delete NAME
-  SD --> [*]: delete NAME
-  RD --> [*]: delete NAME
+  S0 --> R: machine NAME
+  R --> S: idle, or suspend NAME
+  S --> R: input in a client, any connection, or resume NAME
+  R --> [*]: delete NAME
+  S --> [*]: delete NAME
 ```
 
 - `actor NAME` creates the actor suspended, from the golden snapshot. `machine NAME`'s first ssh goes through the
   router, which resumes it, and then registers it with herdr.
-- *Idle or `suspend NAME`* runs three steps in order: disable the machine, kill the websocat tunnel, then
-  `SuspendActor` (the snapshot uploads in the background). A working or blocked agent resets the idle timer.
-- *RUNNING, machine disabled* is the state to watch for. Any connection through the router wakes an actor
-  (`verify`, `debug`, or an ssh you ran by hand), but its machine stays disabled, and the idle bridge only looks at
-  enabled machines, so **the hub never suspends it on its own**. Run `resume NAME` to hand it back to the idle
-  bridge, or `suspend NAME` to put it back to sleep.
+- *Idle or `suspend NAME`* parks the keepers, cuts leftover tunnels, then calls `SuspendActor`; the snapshot
+  uploads in the background. Input or a working or blocked agent resets the idle timer.
+- *Any connection* through the router wakes a suspended actor: input in a client, but also `verify`, `debug`, or
+  herdr's probes when a client starts. Whatever woke it, the idle bridge suspends it again after `IDLE_SECONDS`.
 - `delete NAME` works from any state.
 
 ### Trust and identity
@@ -593,6 +655,7 @@ flowchart TB
 
   subgraph hubns["herdr-hub namespace"]
     HC["herdr client<br/>Unix socket"]
+    KP["herdr-keeper<br/>one per client and machine"]
     PX["ate-wss-proxy<br/>ssh ProxyCommand"]
     HCTL["hubctl"]
   end
@@ -606,6 +669,7 @@ flowchart TB
   subgraph worker["worker, gVisor actor"]
     WS["websocat 0.0.0.0:80"]
     SSHD["sshd 127.0.0.1:2222"]
+    AN["herdr-anchor<br/>Unix socket"]
     HS["herdr server<br/>Unix socket"]
     CL["claude"]
   end
@@ -615,13 +679,15 @@ flowchart TB
   SH -- "kubectl, exec, port-forward" --> KAPI
   KAPI -. "port-forward gRPC" .-> APISVC
   REG -. "image pulls" .-> worker
-  HC -- "ssh ate-NAME" --> PX
+  HC -- "ssh ate-NAME (wrapper)" --> KP
+  KP -- "ssh" --> PX
   PX -- "WSS :443" --> RTR
   HCTL -- "gRPC :443" --> APISVC
   RTR -- "ResumeActor" --> APISVC
   RTR -- "atunnel → :80" --> WS
   WS -- "TCP" --> SSHD
-  SSHD -- "herdr remote session" --> HS
+  SSHD -- "herdr-anchor attach" --> AN
+  AN -- "remote-client-bridge" --> HS
   HS --> CL
   CL -- "HTTPS :443" --> EGW
   EGW -- "real key injected" --> ANT
@@ -630,7 +696,7 @@ flowchart TB
 - In the quick start, nothing listens on your machine except the kind registry (`localhost:5001`) and
   kube-apiserver's mapped port. In production, nothing listens on it at all.
 - Inside an actor only websocat listens on all interfaces (port 80, the one port the router forwards). sshd is on
-  loopback, and herdr uses a Unix socket.
+  loopback; herdr and herdr-anchor use Unix sockets.
 - Actor egress is HTTPS only, through the gateway. The DNS relay answers NXDOMAIN for hosts outside the egress
   policy, so an actor can't even resolve names it isn't allowed to reach.
 
@@ -656,7 +722,7 @@ only apply to the kind registry.
 | `delete <name>` | removes one actor: its herdr machine (first, so nothing reconnects and resumes it), its egress policy, the actor and its snapshot |
 | `verify <name>` | calls the Anthropic API from inside the actor with the placeholder key |
 | `attach` | herdr TUI in the hub, sized to your terminal |
-| `suspend <name>` / `resume <name>` | `hubctl` in the hub (see [Lifecycle](#lifecycle)) |
+| `suspend <name>` / `resume <name>` | `hubctl` in the hub (see [Lifecycle](#lifecycle)); resuming by hand is optional, input wakes actors |
 | `status` | actors and herdr machines, as the hub sees them |
 | `logs` | follows the hub: idle-bridge decisions |
 | `debug <name>` | actor state and logs, hub logs, `ssh -vvv` from the hub |
@@ -876,13 +942,13 @@ sequenceDiagram
   S->>S: read your terminal size
   S->>H: kubectl exec -it: stty rows and cols, then herdr
   H->>H: herdr starts and loads the saved machines
-  H->>X: one SSH session per enabled machine, path 3
+  H->>X: per machine: a keeper, then SSH over path 3 to the actor's anchor
   X-->>H: workspaces, panes, agent states
   U->>H: ctrl+b then q detaches, the actors keep running
 ```
 
-herdr connects only to *enabled* machines and only while a client is attached, so leaving the hub unattended
-doesn't keep actors awake.
+herdr connects only while a client is attached. While it is, idle actors are still suspended, and their machines
+still show online ([Always-on machines](#always-on-machines)).
 
 #### `verify <name>`
 
@@ -917,7 +983,7 @@ sequenceDiagram
   rect rgba(128,128,128,0.08)
   Note over S,W: suspend NAME
   S->>H: hubctl suspend NAME
-  H->>H: herdr machine disable NAME, kill its websocat tunnel
+  H->>H: park NAME's keepers (input cancels), cut leftover tunnels
   H->>A: SuspendActor, path 2
   A->>W: checkpoint memory, free the worker<br/>snapshot uploaded to rustfs in the background
   end
@@ -926,13 +992,14 @@ sequenceDiagram
   S->>H: hubctl resume NAME
   H->>A: ResumeActor, path 2
   A->>W: claim a worker, restore the actor's own snapshot
-  H->>H: herdr machine enable NAME, open clients reconnect
+  H->>H: tell NAME's keepers to reconnect now
   end
 ```
 
-Both run in the hub, because the hub owns the herdr machine list and the order matters: the machine is disabled
-before the suspend and re-enabled after the resume. `hubctl idle-watch` runs the same suspend automatically
-(see [Lifecycle](#lifecycle)).
+Both run in the hub, because the keepers live there and the order matters: they must be parked before the
+suspend. `hubctl idle-watch` runs the same suspend automatically (see [Lifecycle](#lifecycle)). `suspend` refuses
+while someone is typing, or when a keeper can't park; `suspend NAME --force` (in the hub: `hubctl suspend NAME
+--force`) suspends anyway, and the next input wakes the actor again.
 
 #### `delete <name>`
 
@@ -1074,7 +1141,9 @@ fails in ways that look unrelated.
 | `actor/Dockerfile`, `actor/entrypoint.sh`, `actor/sshd_config`, `actor/herdr-config.toml` | the agent actor: Claude Code and a herdr server behind sshd behind websocat :80; pinned binaries; Claude onboarding pre-completed |
 | `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge; takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
 | `hub/ate-wss-proxy` | SSH ProxyCommand: mTLS WebSocket to atenet-router with the pod's SPIFFE certificate |
-| `hub/hubctl` | add/remove machines, suspend/resume, idle bridge, `ate` passthrough |
+| `hub/hubctl` | add/remove machines, suspend/resume (parking keepers), idle bridge, `ate` passthrough |
+| `hub/herdr-keeper`, `hub/ssh` | keeps each machine connection looking online while its actor is suspended; the `ssh` wrapper hands herdr's bridges to it |
+| `actor/herdr-anchor` | holds the hub's herdr session in the actor across suspends, replays after reconnects |
 | `manifests/hub.yaml.tmpl` | hub namespace (`ate.dev/api-access=true`), ServiceAccount, ClusterTrustBundle read RBAC, PVC, Deployment with projected identity, trust and token volumes |
 | `manifests/hub-access-policy.yaml.tmpl` | atespace editor for the hub, nothing global |
 | `manifests/workerpool.yaml.tmpl` | gVisor WorkerPool for the actors; node selector from `WORKER_NODE_SELECTOR` |
@@ -1084,7 +1153,7 @@ fails in ways that look unrelated.
 | `host/herdr-substrate.sh` | every command above |
 | `docs/production-gke.md`, `docs/production-kubernetes.md` | production deployments on GKE and on upstream Kubernetes |
 | `.github/workflows/images.yml` | builds and publishes `herdr-actor` and `herdr-hub` (per substrate release) to GHCR, multi-arch, with provenance |
-| `test/` | `local-bridge-test.sh`, `hub-path-test.sh`, `fake_router.py`, `ssh_config.tmpl`, `Dockerfile.local` |
+| `test/` | `keeper-test.py`, `local-bridge-test.sh`, `hub-path-test.sh`, `fake_router.py`, `ssh_config.tmpl`, `Dockerfile.local` |
 | `.state/` | created by the script: image digests, the hub's public key, rendered manifests. Per checkout; safe to delete |
 
 ## Verification status
@@ -1108,11 +1177,13 @@ fails in ways that look unrelated.
 |---|---|---|
 | ActorTemplate, EgressPolicy, hub AccessPolicy | substrate's own `apivalidation` create-request validators | 0 errors |
 | Hub Deployment, RBAC, PVC, projected `podCertificate`/`clusterTrustBundle`/token volumes | `kubeconform -strict`, Kubernetes 1.34 schemas | valid |
-| Actor image under substrate's exact capability set | `test/local-bridge-test.sh` | 9/9 |
+| Actor image under substrate's exact capability set | `test/local-bridge-test.sh` | 8/8 |
 | The 4 added capabilities are required | same, `NEGATIVE=1` → `chroot("/run/sshd"): Operation not permitted` | confirmed |
 | Hub → mTLS router → actor; SPIFFE allowlist and `ate-target-actor` enforced | `test/hub-path-test.sh` with `test/fake_router.py` | 13/13 |
-| Idle bridge: idle agent → machine disabled → actor suspended; resume | same, `kubectl-ate` stubbed | pass |
-| Enabled machine reconnects after a tunnel drop; a disabled one never does | real herdr TUI | 5 s vs none in 150 s |
+| Always-on: real herdr TUI attached; idle agent → keeper parked → actor suspended, machine stays enabled | same, suspend emulated with `docker pause` | pass |
+| Suspended: luna shows online for 45 s of health checks; nothing reaches the router; a resize doesn't wake it | same | pass |
+| A typed command wakes it: router resumes the actor, keeper rejoins the same session, output on screen | same | container up in 0.16 s, session resumed in 0.38 s |
+| Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor | `test/keeper-test.py` | 23/23 |
 | Scripts | `shellcheck` | clean |
 
 **Production guides** (build environment, 2026-10-25). They have not yet run against a real GKE or upstream
@@ -1138,9 +1209,17 @@ cluster. What was checked offline:
 
 ## Tests
 
-Both run against plain Docker, without a cluster. They need herdr 0.9.5, websocat 1.14 or newer, OpenSSH and
-openssl on your machine (`brew install herdr websocat`), and use a throwaway `HOME`: your own herdr machines
-and `~/.ssh` are untouched.
+`keeper-test.py` needs only Python 3. It runs the keeper and anchor against stand-ins for the herdr server and
+SSH, with SIGSTOP as the suspend:
+
+```bash
+test/keeper-test.py
+```
+
+The other two run against plain Docker, without a cluster. They need herdr 0.9.5, websocat 1.14 or newer,
+OpenSSH, openssl and tmux on your machine (`brew install herdr websocat tmux`), and use a throwaway `HOME`: your
+own herdr machines and `~/.ssh` are untouched. The hub test drives a real herdr TUI in tmux, and emulates
+substrate's suspend with `docker pause`.
 
 ```bash
 docker buildx build --load -t herdr-actor:dev actor/
@@ -1193,6 +1272,14 @@ test/hub-path-test.sh herdr-actor:dev
 - **Pushes to `localhost:5001` need a `docker`-driver builder**; a `docker-container` builder can't reach the
   host's registry. `check` catches this.
 - **No wakeup probe** on the actor: websocat only answers WebSocket upgrades on :80.
+- **herdr's remote bridge has its own idle timeout.** It exits after 60 s without traffic, measured on a clock
+  that includes suspended time (`--idle-timeout-v1`). The anchor runs the bridge without it, and expires a
+  detached session after 15 minutes of *awake* time instead, counted in one-second ticks so clock jumps after a
+  restore don't count.
+- **herdr forces SSH keepalives** (`ServerAliveInterval 15`). They are encrypted, so nothing in between can
+  answer them; a parked keeper drops its SSH session entirely rather than keep one idle.
+- **Wake on intent, not noise.** herdr sends focus, theme and resize frames to every machine whenever your
+  terminal changes. A parked keeper holds them; only input, opening a machine or a request wakes the actor.
 
 ## Security notes
 
@@ -1203,6 +1290,8 @@ test/hub-path-test.sh herdr-actor:dev
 - No agent or port forwarding in either direction (`ForwardAgent no`; the actor's sshd refuses all forwarding).
 - Anyone who can `kubectl exec` into the hub controls every actor: treat the `herdr-hub` namespace as sensitive.
 - Treat each actor's herdr server as untrusted; it is a remote herdr your client renders.
+- `herdr-anchor`'s socket in the actor is root-only, and reaching it already takes the hub's SSH key; the keeper
+  adds no credential of its own. Keeper control sockets live in the hub's `/tmp/herdr-keepers`, root-only.
 - The quick start keeps substrate's development defaults. `ate-client` is a global owner, so anyone with access
   to the cluster can mint its token, and the key Secret sits in an unencrypted local etcd. The production guides
   replace both, and add network and RBAC limits around the hub.
@@ -1229,8 +1318,8 @@ flowchart TD
   D5 -- no --> F5["host/herdr-substrate.sh hub<br/>check the podcertificate controller"]
   D5 -- yes --> D6{"status lists actors?"}
   D6 -- PermissionDenied --> F6["re-run deploy:<br/>grants the hub's access policy"]
-  D6 -- yes --> D7{"actor's herdr machine enabled?"}
-  D7 -- "disabled" --> F7["expected while suspended:<br/>resume NAME"]
+  D6 -- yes --> D7{"herdr shows the machine online?"}
+  D7 -- "reconnecting" --> F7["keeper log:<br/>/tmp/herdr-keepers/NAME/*.log in the hub"]
   D7 -- "unknown machine" --> F8["machine NAME"]
   D7 -- yes --> D8{"debug NAME:<br/>ssh -vvv from the hub works?"}
   D8 -- no --> F9["read the actor's logs in debug output:<br/>sshd, herdr server, websocat"]
@@ -1253,12 +1342,15 @@ the hub.
 | `deploy`: "no hub SSH key" | run `hub` (the key is kept on the hub's volume; `.state` is only a local copy) |
 | `herdr: cannot attach without a usable terminal: … zero-sized grid` | use `host/herdr-substrate.sh attach`, which sets the terminal size |
 | `error: unknown machine '<name>'` | the `machine <name>` step hasn't completed; run it |
-| `machine '<name>' is disabled` | expected while suspended; `resume <name>` |
+| `machine '<name>' is disabled` | disabled by hand, or by an older version of this kit. `herdr machine enable <id>` in the hub; `idle-watch` re-enables `ate-*` machines when the hub starts |
 | Claude Code: "Unable to connect to Anthropic services … platform.claude.com: ENOTFOUND" | actor built from an older image without pre-completed onboarding. In its pane: `python3 -c 'import json,os;p=os.path.expanduser("~/.claude.json");d=json.load(open(p)) if os.path.exists(p) else {};d["hasCompletedOnboarding"]=True;json.dump(d,open(p,"w"))'` |
 | `verify`: "API answered with an error" | the gateway didn't inject the key: check the Secret, and that `deploy` granted the credential-provider policy |
 | `remote server is not ready for saved machines` | actor image without `setsid` (old build) or herdr version mismatch between hub and actor |
 | `REMOTE HOST IDENTIFICATION HAS CHANGED` | template recreated outside `deploy`; in the hub: `ssh-keygen -R herdr-substrate-herdr-agents -f ~/.ssh/known_hosts.herdr-substrate` |
-| An actor resumes right after being suspended | something re-enabled its machine or resumed it; check `status` and `logs` |
+| An actor resumes right after being suspended | something connected through the router: input in a client (expected), or `verify`, `debug`, herdr's probes when a client starts. It is suspended again after `IDLE_SECONDS`; `logs` shows why it woke |
+| `logs`: `not suspending, keeper reported: busy` | someone typed while the keepers were parking; the next poll tries again |
+| `logs`: `not suspending, keeper reported: unsupported` | the actor's image has no `herdr-anchor` (built before it existed): it works, but can't be suspended under an attached client. Rebuild with `image`, then `down` and `deploy` to recreate the template |
+| A machine shows `reconnecting` after a long suspend | the resume took longer than `HERDR_KEEPER_WAKE_TIMEOUT` (180 s), or the actor lost its session (reverted, crashed, or the anchor's 15-minute cleanup ran). herdr reconnects by itself; the keeper log in the hub (`/tmp/herdr-keepers/<name>/`) says which |
 | zsh: a pasted command waits at `quote>` | it contained a `#` comment with an apostrophe; press Ctrl-C. `setopt interactive_comments` in `~/.zshrc` makes zsh accept comments |
 
 ## Changelog
@@ -1282,3 +1374,9 @@ Fixes made while bringing the kit up on a real cluster, all included above:
 - **Prebuilt images:** a GitHub workflow publishes `herdr-actor` and `herdr-hub` to GHCR for amd64 and arm64.
   The script takes them through `ACTOR_IMAGE` and `HUB_IMAGE`, by tag or digest. The hub image now takes
   `kubectl-ate` from `hub/bin/linux-<arch>/`, so one build can cover several platforms.
+- **Always-on machines:** herdr machines are no longer disabled while their actor is suspended.
+  - **How:** a `herdr-keeper` in the hub answers herdr's health checks for a parked machine, and a `herdr-anchor`
+    in the actor keeps the session alive across the suspend. Input wakes the actor.
+  - **Idle detection:** idle means no working or blocked agent *and* no input, and only running actors are polled.
+  - **Older images:** actors without the anchor fall back to a plain relay and aren't suspended under an
+    attached client.

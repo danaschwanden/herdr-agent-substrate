@@ -37,10 +37,14 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/herdr /usr/local/bin/websocat
 
 COPY bin/linux-${TARGETARCH}/kubectl-ate /usr/local/bin/kubectl-ate
-COPY ate-wss-proxy hubctl /usr/local/bin/
+COPY ate-wss-proxy hubctl herdr-keeper /usr/local/bin/
+# herdr runs `ssh` from PATH; this wrapper hands ate-* client bridges to
+# herdr-keeper and everything else to /usr/bin/ssh.
+COPY ssh /usr/local/lib/herdr-hub/bin/ssh
 COPY entrypoint.sh /usr/local/bin/herdr-hub-entrypoint
 COPY herdr-config.toml /etc/herdr-hub/herdr-config.toml
-RUN chmod 0755 /usr/local/bin/kubectl-ate /usr/local/bin/ate-wss-proxy \
+RUN chmod 0755 /usr/local/bin/herdr-keeper /usr/local/lib/herdr-hub/bin/ssh \
+ && chmod 0755 /usr/local/bin/kubectl-ate /usr/local/bin/ate-wss-proxy \
       /usr/local/bin/hubctl /usr/local/bin/herdr-hub-entrypoint
 
 # HOME is the persistent volume (see manifests/hub.yaml.tmpl). Root's passwd
@@ -49,6 +53,7 @@ RUN chmod 0755 /usr/local/bin/kubectl-ate /usr/local/bin/ate-wss-proxy \
 # (usermod refuses: the build's own RUN process is root.)
 RUN sed -i 's#^\(root:[^:]*:0:0:[^:]*:\)[^:]*:#\1/var/lib/herdr-hub:#' /etc/passwd \
  && test "$(getent passwd root | cut -d: -f6)" = /var/lib/herdr-hub
-ENV HOME=/var/lib/herdr-hub LANG=C.UTF-8 TERM=xterm-256color
+ENV HOME=/var/lib/herdr-hub LANG=C.UTF-8 TERM=xterm-256color \
+    PATH=/usr/local/lib/herdr-hub/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WORKDIR /var/lib/herdr-hub
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/herdr-hub-entrypoint"]

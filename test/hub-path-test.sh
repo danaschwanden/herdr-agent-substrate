@@ -7,11 +7,17 @@
 #     -> actor container (actor image, substrate's capability set)
 #
 # kubectl-ate is replaced by a stub that records the lifecycle calls hubctl
-# makes, so the idle bridge's suspend and resume can be checked.
+# makes and emulates substrate's: "suspend actor" pauses the actor container
+# (its processes freeze, as in a memory snapshot), and the router stand-in
+# unpauses it when a connection arrives, as atenet-router resumes actors.
 #
-# Needs: docker, herdr, websocat, ssh, openssl, python3 with `websockets`,
-# and atenet-router.ate-system.svc resolving to 127.0.0.1 (add it to
-# /etc/hosts). Usage: test/hub-path-test.sh [ACTOR_IMAGE]
+# The second half attaches a real herdr TUI (in tmux) and checks the always-on
+# behaviour: the machine stays enabled and shows online while its actor is
+# suspended, and input wakes it.
+#
+# Needs: docker, herdr, websocat, ssh, openssl, tmux, python3 with
+# `websockets`, and atenet-router.ate-system.svc resolving to 127.0.0.1 (add
+# it to /etc/hosts). Usage: test/hub-path-test.sh [ACTOR_IMAGE]
 # shellcheck disable=SC2015 # "check && ok || bad" is safe: ok and bad always succeed
 set -euo pipefail
 
@@ -30,7 +36,11 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; pass=$((pass + 1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=$((fail + 1)); }
 step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
+tui() { tmux -L "${NAME}" "$@"; }
+
 cleanup() {
+  tui kill-server 2>/dev/null || true
+  docker unpause "${NAME}" >/dev/null 2>&1 || true
   [[ -n "${hub_pid}" ]] && kill -- -"${hub_pid}" 2>/dev/null || true
   [[ -n "${router_pid}" ]] && kill "${router_pid}" 2>/dev/null || true
   docker rm -f "${NAME}" >/dev/null 2>&1 || true
@@ -39,7 +49,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for c in docker herdr websocat ssh openssl python3 setsid; do
+for c in docker herdr websocat ssh openssl python3 setsid tmux; do
   command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
 done
 python3 -c 'import websockets' 2>/dev/null || { echo "pip install websockets" >&2; exit 1; }
@@ -75,11 +85,18 @@ mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/kubectl-ate" <<'EOF'
 #!/bin/sh
 echo "kubectl-ate $*" >>"${STUB_LOG}"
-case "$*" in *"get actors"*) echo '{"actors":[]}' ;; esac
+case "$*" in
+  *"get actors"*)
+    state=ACTOR_STATE_RUNNING
+    [ "$(docker inspect -f '{{.State.Paused}}' "${ACTOR_CONTAINER}")" = true ] && state=ACTOR_STATE_SUSPENDED
+    printf '{"actors":[{"metadata":{"name":"luna"},"status":{"state":"%s"}}]}\n' "${state}" ;;
+  *"suspend actor"*) docker pause "${ACTOR_CONTAINER}" >/dev/null ;;
+  *"resume actor"*) docker unpause "${ACTOR_CONTAINER}" >/dev/null 2>&1 || true ;;
+esac
 exit 0
 EOF
 chmod +x "${WORK}/bin/kubectl-ate"
-export STUB_LOG="${WORK}/kubectl-ate.log"; : >"${STUB_LOG}"
+export STUB_LOG="${WORK}/kubectl-ate.log" ACTOR_CONTAINER="${NAME}"; : >"${STUB_LOG}"
 echo token >"${WORK}/token"
 
 export PATH="${WORK}/bin:${KIT_DIR}/hub:${PATH}"
@@ -89,7 +106,8 @@ export DOCKER_CONFIG="${DOCKER_CONFIG:-${HOME}/.docker}"
 export HOME="${WORK}/hub-home"; mkdir -p "${HOME}"
 export ATE_IDENTITY_BUNDLE="${pki}/hub.bundle.pem" ATE_ROUTER_CA="${pki}/servicedns.crt" \
        ATE_API_TOKEN="${WORK}/token" ATE_ROUTER_URL="wss://${ROUTER_HOST}:${ROUTER_PORT}/" \
-       HUB_SHARE="${KIT_DIR}/hub" IDLE_SECONDS=15 POLL_SECONDS=3
+       HUB_SHARE="${KIT_DIR}/hub" IDLE_SECONDS=15 POLL_SECONDS=3 \
+       HERDR_KEEPER_RUN="${WORK}/keepers"
 
 step "1. hub starts and generates its SSH key"
 setsid bash "${KIT_DIR}/hub/entrypoint.sh" >"${WORK}/hub.log" 2>&1 &
@@ -106,6 +124,7 @@ docker run -d --name "${NAME}" -p "127.0.0.1:${ACTOR_PORT}:80" \
 python3 "${KIT_DIR}/test/fake_router.py" --listen "127.0.0.1:${ROUTER_PORT}" \
   --cert "${pki}/router.crt" --key "${pki}/router.key" --client-ca "${pki}/podidentity.crt" \
   --allow "${HUB_ID}" --actor "${ATESPACE}/luna=ws://127.0.0.1:${ACTOR_PORT}/" \
+  --container "${ATESPACE}/luna=${NAME}" \
   >"${WORK}/router.log" 2>&1 &
 router_pid=$!
 for _ in $(seq 1 30); do
@@ -151,28 +170,66 @@ print(a[0]["agent_status"] if a else "missing")' 2>/dev/null || echo error)"
 done
 [[ "${status}" == working ]] && ok "agent testbot working, seen from the hub" || bad "agent status: ${status}"
 
-step "6. idle bridge suspends the actor once its agent goes idle"
-herdr --machine luna pane report-agent "${pane}" --source custom:test --agent testbot --state idle --seq 2 >/dev/null 2>&1 || true
+[[ "${EXPLORE:-0}" == 1 ]] && { echo "exploring: ${WORK}"; sleep infinity; }
+
+luna_row() { tui capture-pane -p -t tui | grep -m1 '▾ luna' | sed 's/[[:space:]]*$//'; }
+paused() { docker inspect -f '{{.State.Paused}}' "${NAME}"; }
+keeper_log() { cat "${HERDR_KEEPER_RUN}"/luna/*[0-9].log 2>/dev/null || true; }
+key() { tui send-keys -t tui "$@"; sleep 0.5; }
+
+step "6. a herdr TUI attaches; luna is online through a keeper"
+tui new-session -d -s tui -x 160 -y 45 herdr
+for _ in $(seq 1 40); do [[ "$(luna_row)" == *●* ]] && break; sleep 1; done
+[[ "$(luna_row)" == *●* ]] && ok "luna shows online" || bad "luna row: '$(luna_row)'"
+compgen -G "${HERDR_KEEPER_RUN}/luna/*.sock" >/dev/null && ok "a keeper carries the TUI's connection" || bad "no keeper socket"
+# First-run notice, then open luna's shell workspace (Local, then luna's ~).
+key Enter; key Escape; key C-b; key w; key Down; key Enter; sleep 1
+tui capture-pane -p -t tui | grep -q 'new · luna' && ok "luna's shell workspace is active" || bad "could not open luna's workspace"
+
+step "7. idle: the actor is suspended while the TUI stays attached"
+# The test's own CLI call must not count as user activity.
+HERDR_KEEPER_BYPASS=1 herdr --machine luna pane report-agent "${pane}" --source custom:test \
+  --agent testbot --state idle --seq 2 >/dev/null 2>&1 || true
 start=$SECONDS
-until grep -q "suspend actor luna -a ${ATESPACE}" "${STUB_LOG}" || (( SECONDS - start > 60 )); do sleep 2; done
-if grep -q "suspend actor luna -a ${ATESPACE}" "${STUB_LOG}"; then
-  ok "suspended after $((SECONDS - start))s (IDLE_SECONDS=${IDLE_SECONDS}, POLL_SECONDS=${POLL_SECONDS})"
+until [[ "$(paused)" == true ]] || (( SECONDS - start > 90 )); do sleep 2; done
+if [[ "$(paused)" == true ]]; then
+  ok "suspended after $((SECONDS - start))s, TUI attached (IDLE_SECONDS=${IDLE_SECONDS})"
 else
-  bad "idle bridge never suspended; hub log: $(tail -n 5 "${WORK}/hub.log")"
+  bad "never suspended; hub log: $(tail -n 3 "${WORK}/hub.log")"
 fi
+keeper_log | grep -q '\[parked\] parked' && ok "keeper parked before the suspend" || bad "keeper never parked"
 enabled="$(herdr machine list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["enabled"])')"
-[[ "${enabled}" == False ]] && ok "machine disabled before the suspend" || bad "machine still enabled"
-if herdr --machine luna agent list >/dev/null 2>&1; then bad "--machine still reaches the suspended actor"; else ok "--machine refuses it while suspended"; fi
+[[ "${enabled}" == True ]] && ok "machine stays enabled" || bad "machine was disabled"
 
-step "7. hubctl resume"
-hubctl resume luna >/dev/null 2>&1 || true
-grep -q "resume actor luna -a ${ATESPACE}" "${STUB_LOG}" && ok "resume call made" || bad "no resume call"
-status="$(herdr --machine luna agent list 2>/dev/null | python3 -c '
-import json, sys
-a = [a for a in json.load(sys.stdin)["result"]["agents"] if a.get("agent") == "testbot"]
-print(a[0]["agent_status"] if a else "missing")' 2>/dev/null || echo error)"
-case "${status}" in idle|done) ok "machine re-enabled, agent state intact (${status})" ;; *) bad "after resume: ${status}" ;; esac
+step "8. suspended: the TUI keeps showing luna online"
+wrong=0 woke=0
+for _ in $(seq 1 15); do
+  row="$(luna_row)"
+  [[ "${row}" == *●* && "${row}" != *connecting* ]] || wrong=$((wrong + 1))
+  [[ "$(paused)" == true ]] || woke=1
+  sleep 3
+done
+(( wrong == 0 )) && ok "45s of health checks answered locally; luna never left online" || bad "${wrong} samples not online"
+(( woke == 0 )) && ! grep -q RESUME "${WORK}/router.log" && ok "nothing reached the router; the actor stayed suspended" \
+  || bad "the actor was woken while idle"
+tui resize-window -t tui -x 150 -y 44; sleep 4
+[[ "$(paused)" == true ]] && ok "a window resize is held, it doesn't wake the actor" || bad "a resize woke the actor"
 
-echo; echo "lifecycle calls made by the hub:"; sed 's/^/  /' "${STUB_LOG}"
+step "9. typing wakes it, and the same session carries on"
+start=$SECONDS
+# shellcheck disable=SC2016 # expanded by the shell on luna, proving the command ran there
+tui send-keys -t tui 'echo always-on-$((6*7))' Enter
+until tui capture-pane -p -t tui | grep -q 'always-on-42' || (( SECONDS - start > 60 )); do sleep 0.5; done
+tui capture-pane -p -t tui | grep -q 'always-on-42' \
+  && ok "command ran on luna, output on screen after $((SECONDS - start))s" || bad "no output from luna"
+grep -q "RESUME ${ATESPACE}/luna" "${WORK}/router.log" && ok "the router resumed the actor on demand" || bad "no RESUME"
+keeper_log | grep -q 'connected (resumed' && ok "keeper rejoined its session" || bad "keeper did not resume its session"
+started="$(docker logs "${NAME}" 2>&1 | grep -c 'bridge started' || true)"
+[[ "${started}" == 1 ]] && ok "herdr's server-side session never restarted" || bad "bridge started ${started} times"
+[[ "$(luna_row)" == *●* ]] && ok "luna online throughout" || bad "luna row: '$(luna_row)'"
+hubctl status 2>/dev/null | grep -q 'keeper luna (pid [0-9]*): awake' \
+  && ok "hubctl status shows the keeper awake" || bad "hubctl status: $(hubctl status 2>&1 | tail -n 2)"
+
+echo; echo "lifecycle calls made by the hub (polls omitted):"; grep -v "get actors" "${STUB_LOG}" | sed 's/^/  /' || true
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 (( fail == 0 ))

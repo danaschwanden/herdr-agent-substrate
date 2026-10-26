@@ -61,7 +61,9 @@ RUN printf '{"hasCompletedOnboarding": true}\n' >/root/.claude.json
 COPY sshd_config /etc/ssh/sshd_config.d/actor.conf
 COPY herdr-config.toml /root/.config/herdr/config.toml
 COPY entrypoint.sh /usr/local/bin/herdr-actor-entrypoint
-RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint
+# Holds herdr client sessions across suspends (the hub's herdr-keeper attaches).
+COPY herdr-anchor /usr/local/bin/herdr-anchor
+RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint /usr/local/bin/herdr-anchor
 
 WORKDIR /work
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/herdr-actor-entrypoint"]

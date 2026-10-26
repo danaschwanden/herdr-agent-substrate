@@ -10,11 +10,16 @@ the hub is concerned:
 It then relays WebSocket messages both ways. Each accepted request is logged
 as "ROUTE <spiffe-id> -> <atespace>/<actor>" so the test can count them.
 
+With --container <atespace>/<actor>=<docker container>, a request for a
+paused container unpauses it first and logs "RESUME <atespace>/<actor>",
+like substrate's router resuming a suspended actor when a connection arrives.
+
 Needs: pip install websockets
 """
 import argparse
 import asyncio
 import ssl
+import subprocess
 import sys
 
 from websockets.asyncio.client import connect
@@ -46,9 +51,24 @@ def main():
     ap.add_argument("--allow", action="append", default=[], help="allowed SPIFFE ID")
     ap.add_argument("--actor", action="append", default=[],
                     help="<atespace>/<actor>=ws://host:port/ backend")
+    ap.add_argument("--container", action="append", default=[],
+                    help="<atespace>/<actor>=<docker container> to unpause on demand")
     args = ap.parse_args()
 
     backends = dict(a.split("=", 1) for a in args.actor)
+    containers = dict(a.split("=", 1) for a in args.container)
+    resume_lock = asyncio.Lock()
+
+    async def resume_if_paused(target):
+        name = containers.get(target)
+        if not name:
+            return
+        async with resume_lock:
+            paused = subprocess.run(["docker", "inspect", "-f", "{{.State.Paused}}", name],
+                                    capture_output=True, text=True).stdout.strip()
+            if paused == "true":
+                print(f"RESUME {target}", flush=True)
+                subprocess.run(["docker", "unpause", name], capture_output=True)
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(args.cert, args.key)
     ctx.load_verify_locations(args.client_ca)
@@ -69,6 +89,7 @@ def main():
 
     async def relay(client):
         target = client.ate_target
+        await resume_if_paused(target)
         async with connect(backends[target], max_size=None, ping_interval=None) as actor:
             async def pump(src, dst):
                 async for message in src:

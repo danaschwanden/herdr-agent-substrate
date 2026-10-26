@@ -102,7 +102,7 @@ print(a[0]["agent_status"] if a else "missing")')"
 done
 if [[ "${status}" == working ]]; then ok "agent testbot reported working"; else bad "agent status: ${status}"; fi
 
-step "5. disabled machines cannot be reached (what 'suspend' relies on)"
+step "5. an operator can still take a machine offline: disabled machines can't be reached"
 id="$(herdr machine list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')"
 herdr machine disable "${id}" >/dev/null
 pkill -f -- "ate-target-actor: ${ATESPACE}/luna\$" 2>/dev/null || true

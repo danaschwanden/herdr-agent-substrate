@@ -899,7 +899,7 @@ kubectl --context "$KUBE_CONTEXT" -n herdr-hub exec deploy/herdr-hub -- hubctl p
 | What | How |
 |---|---|
 | GKE | Release channel auto-upgrades. Workers get `SIGTERM` and 30 minutes to suspend their actors, so set a maintenance window |
-| herdr or Claude Code | Rebuild with `image` (and `hub-image` for herdr). Templates are immutable, so new agents need a new template: run `down` and `deploy` in a maintenance window, then recreate the actors. `down` deletes the actors |
+| herdr or Claude Code | Rebuild with `image` (and `hub-image` for herdr). Templates are immutable, so new agents need a new template: run `down` and `deploy` in a maintenance window, then recreate the actors. `down` deletes the actors. For a new herdr version, run `test/keeper-test.py` and `test/hub-path-test.sh` first: the always-on keeper relies on herdr's endpoint protocol |
 | Substrate, patch release | In place, by substrate's upgrade runbook (`docs/upgrade.md`), once releases are 1.0 or later |
 | Substrate, new minor before 1.0 | Not supported in place. Stand up a second cluster from this guide at the new version, move operators over, delete the old one |
 

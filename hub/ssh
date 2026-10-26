@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# ssh wrapper for the hub, first on PATH (see hub/Dockerfile).
+#
+# herdr reaches a saved machine with `ssh [options] -T <target> '<bridge cmd>'`
+# and speaks its protocol over that process's stdin/stdout. For ate-* targets
+# that bridge goes to herdr-keeper, which keeps the machine looking online
+# while its actor is suspended. Everything else -- herdr's probes, scp-like
+# uploads, hubctl's calls (HERDR_KEEPER_BYPASS=1), interactive ssh -- runs the
+# real ssh unchanged.
+REAL_SSH="${HERDR_REAL_SSH:-/usr/bin/ssh}"
+if [[ -z "${HERDR_KEEPER_BYPASS:-}" && $# -ge 2 ]]; then
+  target="${*: -2:1}"
+  command="${*: -1}"
+  if [[ "${target}" == ate-* && "${command}" == *remote-client-bridge* ]]; then
+    export HERDR_REAL_SSH="${REAL_SSH}"
+    exec herdr-keeper --target "${target}" --command "${command}" -- "$@"
+  fi
+fi
+exec "${REAL_SSH}" "$@"

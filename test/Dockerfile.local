@@ -15,6 +15,7 @@ RUN printf '{"hasCompletedOnboarding": true}\n' >/root/.claude.json
 COPY actor/sshd_config /etc/ssh/sshd_config.d/actor.conf
 COPY actor/herdr-config.toml /root/.config/herdr/config.toml
 COPY actor/entrypoint.sh /usr/local/bin/herdr-actor-entrypoint
-RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint
+COPY actor/herdr-anchor /usr/local/bin/herdr-anchor
+RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint /usr/local/bin/herdr-anchor
 WORKDIR /work
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/herdr-actor-entrypoint"]

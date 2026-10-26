@@ -956,7 +956,7 @@ kubectl --context "$KUBE_CONTEXT" -n herdr-hub exec deploy/herdr-hub -- hubctl p
 | What | How |
 |---|---|
 | Kubernetes | Your distribution's process. Drain agent nodes one at a time: workers get `SIGTERM` and 30 minutes to suspend their actors |
-| herdr or Claude Code | As on GKE: rebuild, then `down` and `deploy` in a maintenance window (`down` deletes the actors) |
+| herdr or Claude Code | As on GKE: rebuild, then `down` and `deploy` in a maintenance window (`down` deletes the actors). For a new herdr version, run `test/keeper-test.py` and `test/hub-path-test.sh` first: the always-on keeper relies on herdr's endpoint protocol |
 | Substrate, new minor before 1.0 | Not supported in place. Build a new cluster at the new release, port the overlay patch, move operators, retire the old one |
 
 ### Tear down

@@ -24,6 +24,11 @@ if [[ -z "${AUTHORIZED_KEYS:-}" ]]; then
   exit 1
 fi
 
+# --- temp directories --------------------------------------------------------
+# The sandbox's rootfs can surface /tmp as 0777 without the sticky bit. Claude
+# Code then refuses to create its cross-session messaging socket there.
+chmod 1777 /tmp /var/tmp 2>/dev/null || log "WARNING: could not set mode 1777 on /tmp"
+
 # --- SSH host key and authorized keys -------------------------------------
 # The host key is generated on first boot, i.e. while substrate builds the
 # template's golden snapshot. Every actor cloned from that snapshot therefore

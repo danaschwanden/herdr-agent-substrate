@@ -301,14 +301,26 @@ cmd_hub_image() {
   build_push "${KIT_DIR}/hub" herdr-hub
 }
 
+# The kit's egress policy for an actor: only api.anthropic.com, with the key
+# from CREDENTIAL_URI injected by the gateway. Used by `actor` and, through
+# the ConfigMap `hub` writes, by `hubctl create`.
+render_egress_policy() {
+  ATESPACE="${ATESPACE}" CREDENTIAL_URI="${CREDENTIAL_URI}" \
+    render "${KIT_DIR}/manifests/egress-policy.yaml.tmpl" >"$1"
+}
+
 cmd_hub() {
   need kubectl python3
   local hub_image
   hub_image="$(pinned_image herdr-hub "${HUB_IMAGE}" hub-image)"
-  export HUB_NAMESPACE ATESPACE IDLE_SECONDS POLL_SECONDS HUB_WEB_ADDR HUB_WEB_AUTH_HEADER
+  export HUB_NAMESPACE ATESPACE IDLE_SECONDS POLL_SECONDS HUB_WEB_ADDR HUB_WEB_AUTH_HEADER TEMPLATE_NAME
   export HUB_IMAGE="${hub_image}"
   log "deploying the hub in namespace ${HUB_NAMESPACE}"
   render "${KIT_DIR}/manifests/hub.yaml.tmpl" | k apply -f -
+  # The default egress policy for `hubctl create`, the same one `actor` uses.
+  render_egress_policy "${STATE_DIR}/egress-policy.yaml"
+  k -n "${HUB_NAMESPACE}" create configmap herdr-hub-egress-policy \
+    --from-file=egress-policy.yaml="${STATE_DIR}/egress-policy.yaml" --dry-run=client -o yaml | k apply -f -
   k -n "${HUB_NAMESPACE}" rollout status deployment/herdr-hub --timeout=5m
   local _
   for _ in $(seq 1 30); do
@@ -451,8 +463,7 @@ cmd_actor() {
     || die "could not read the egress policy of ${ATESPACE}/${name}"
   if [[ -z "${current}" ]]; then
     log "allowing ${name} to reach api.anthropic.com (key injected by the gateway)"
-    ATESPACE="${ATESPACE}" CREDENTIAL_URI="${CREDENTIAL_URI}" \
-      render "${KIT_DIR}/manifests/egress-policy.yaml.tmpl" >"${STATE_DIR}/egress-policy.yaml"
+    render_egress_policy "${STATE_DIR}/egress-policy.yaml"
     ate create egress-policy "${name}" -a "${ATESPACE}" -f "${STATE_DIR}/egress-policy.yaml"
   fi
 }

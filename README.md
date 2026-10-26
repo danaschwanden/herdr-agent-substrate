@@ -273,6 +273,14 @@ host/herdr-substrate.sh machine luna
 `machine` connects from the hub through the router into the actor and saves it as a herdr machine. It ends
 with `Saved SSH machine … Remote server is ready.` Repeat both commands with other names for more actors.
 
+From inside the hub (a tab on herdr's **Local** machine, in `attach` or `web`), one command does all of it:
+
+```bash
+hubctl create mars
+```
+
+See [Agents from inside the hub](#agents-from-inside-the-hub).
+
 ### 12. Verify
 
 ```bash
@@ -777,10 +785,11 @@ only apply to the kind registry.
 | `cluster` | substrate's `create-kind-cluster.sh`; `install-ate-kind.sh deploy ate-system` with the k8s.io credential provider and the hub in `ATE_INGRESS_ALLOWED_SPIFFE_IDS`; `deploy demo counter` (scaled to 0 workers, used for its worker image); `go install ./cmd/kubectl-ate` |
 | `image` | builds `actor/`, pushes to `REGISTRY` (`localhost:5001`), records the digest (templates must be digest-pinned). Not needed with a prebuilt `ACTOR_IMAGE` |
 | `hub-image` | cross-builds `kubectl-ate` from your substrate checkout into `hub/bin/linux-<arch>/`, builds and pushes `hub/`. Not needed with a prebuilt `HUB_IMAGE` |
-| `hub` | applies `manifests/hub.yaml.tmpl`; waits for the hub's SSH key |
+| `hub` | applies `manifests/hub.yaml.tmpl` and the default egress policy for `hubctl create`; waits for the hub's SSH key |
 | `deploy` | WorkerPool, Anthropic Secret + credential-provider grant, atespace, hub access policy, ActorTemplate trusting the hub key; waits for the golden snapshot |
 | `actor <name>` | creates the actor and its egress policy |
 | `machine <name>` | `hubctl add <name>` in the hub: pins the host key, `herdr machine add` |
+| (in the hub) `hubctl create <name>` / `hubctl delete <name>` | `actor` plus `machine`, and `delete`, from a shell in the hub ([Agents from inside the hub](#agents-from-inside-the-hub)) |
 | `delete <name>` | removes one actor: its herdr machine (first, so nothing reconnects and resumes it), its egress policy, the actor and its snapshot |
 | `verify <name>` | calls the Anthropic API from inside the actor with the placeholder key |
 | `attach` | herdr TUI in the hub, sized to your terminal |
@@ -1099,6 +1108,39 @@ sequenceDiagram
   S->>A: DeleteActor NAME, discards its snapshot
 ```
 
+#### Agents from inside the hub
+
+The hub can create and delete agents itself, with no laptop involved. Open a tab on herdr's **Local** machine,
+which is the hub, and:
+
+```bash
+hubctl create mars
+```
+
+```bash
+hubctl delete mars
+```
+
+- **`create`** does `actor` and `machine` in one go:
+  - creates the actor from the kit's template (`herdr-agent`) in the hub's atespace;
+  - gives it the kit's egress policy, only `api.anthropic.com` with the key injected;
+  - saves it as a herdr machine, so it appears in every client's sidebar.
+
+  Each part is skipped if it already exists, so a create that failed halfway can simply be re-run.
+- **`delete`** reverses it in the safe order: the machine first, so no client wakes the actor, then the egress
+  policy, then the actor and its snapshot.
+- **A different egress policy** for one actor: `hubctl create mars --policy FILE`. The file has the same format
+  as `manifests/egress-policy.yaml.tmpl`, for example with `api.github.com` added. An existing actor's policy is
+  left alone; change it with `hubctl ate update egress-policy`.
+
+The default policy is the same one `actor` uses. `hub` renders it with your `CREDENTIAL_URI` into the ConfigMap
+`herdr-hub-egress-policy`, which the hub mounts. Re-run `hub` after changing `CREDENTIAL_URI`.
+
+The hub could already do all of this through `hubctl ate`: substrate lets an atespace editor create actors and
+their egress policies. `create` only makes it one step. That means anyone with a shell in the hub, including the
+browser link, can start agents that spend from your Anthropic account. Agents only reach keys the atespace was
+granted (`deploy`), and only `WORKER_REPLICAS` of them run at once.
+
 #### `status`, `logs` and `debug <name>`
 
 - `status`: `hubctl status` in the hub, so it shows the hub's view: actors over path 2 and the hub's herdr machines.
@@ -1230,7 +1272,7 @@ fails in ways that look unrelated.
 | `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge and the web terminal (ttyd); takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
 | `hub/herdr-web.js`, `hub/herdr-web-index` | the web terminal's copy, paste and right-click handling, and the script that adds it to ttyd's page when the hub starts |
 | `hub/ate-wss-proxy` | SSH ProxyCommand: mTLS WebSocket to atenet-router with the pod's SPIFFE certificate |
-| `hub/hubctl` | add/remove machines, suspend/resume (parking keepers), idle bridge, `ate` passthrough |
+| `hub/hubctl` | create/delete agents, add/remove machines, suspend/resume (parking keepers), idle bridge, `ate` passthrough |
 | `hub/herdr-keeper`, `hub/ssh` | keeps each machine connection looking online while its actor is suspended; the `ssh` wrapper hands herdr's bridges to it |
 | `actor/herdr-anchor` | holds the hub's herdr session in the actor across suspends, replays after reconnects |
 | `manifests/hub.yaml.tmpl` | hub namespace (`ate.dev/api-access=true`), ServiceAccount, ClusterTrustBundle read RBAC, PVC, Deployment with projected identity, trust and token volumes |
@@ -1449,6 +1491,8 @@ the hub.
 | `logs`: `not suspending, keeper reported: busy` | someone typed while the keepers were parking; the next poll tries again |
 | `logs`: `not suspending, keeper reported: unsupported` | the actor's image has no `herdr-anchor` (built before it existed): it works, but can't be suspended under an attached client. Rebuild with `image`, then `down` and `deploy` to recreate the template |
 | A machine shows `reconnecting` after a long suspend | the resume took longer than `HERDR_KEEPER_WAKE_TIMEOUT` (180 s), or the actor lost its session (reverted, crashed, or the anchor's 15-minute cleanup ran). herdr reconnects by itself; the keeper log in the hub (`/tmp/herdr-keepers/<name>/`) says which |
+| `hubctl create`: "no egress policy at /etc/herdr-hub/policy/egress-policy.yaml" | the hub was deployed before `create` existed: re-run `hub`. Or pass `--policy FILE` |
+| `hubctl create`: `PermissionDenied` | the hub's access policy is missing; re-run `deploy` |
 | `web`: "this hub image has no web terminal" | the hub runs an image from before ttyd was added: `hub-image` (or a newer `HUB_IMAGE`), then `hub` |
 | `web`: "port-forward failed" | something else uses local port 7681: `WEB_PORT=7682 host/herdr-substrate.sh web` |
 | Web: selecting text doesn't copy, or says "The browser blocked the copy" | the page isn't on `localhost` or `https` (browsers only allow clipboard access there), or Safari refused. Use `web`'s `http://localhost` URL or the shared `https` link; Chrome and Edge allow it |
@@ -1487,5 +1531,7 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   browser (`hub/herdr-web.js`). Before, ttyd ignored herdr's copies and the browser's menu covered herdr's.
 - **herdr in the browser:** the hub runs ttyd on its loopback, and the new `web` command port-forwards to it and
   opens the page. Each guide's step 14 adds a shared link behind sign-in: IAP on GKE, oauth2-proxy elsewhere.
+- **Agents from inside the hub:** `hubctl create <name> [--policy FILE]` and `hubctl delete <name>`. `hub` now
+  also installs the default egress policy in the hub.
 - **Container `/tmp`:** the actor entrypoint sets `/tmp` and `/var/tmp` to mode 1777, which Claude Code needs
   for its cross-session messaging socket.

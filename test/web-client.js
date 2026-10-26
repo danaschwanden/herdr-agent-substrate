@@ -11,6 +11,10 @@
 //                                     selection; the last line with it that
 //                                     isn't the command echoing it)
 //   {"rightclick": "text"}            right-click on that text
+//   {"click": "text"}                 click the first line showing text (e.g. a
+//                                     workspace in herdr's sidebar)
+//   {"click": "text", "until": "t2"}  click again until the screen shows t2
+//                                     and keeps showing it for 2 s
 //   {"clipboard": "text"}             until the clipboard holds exactly this
 //   {"setClipboard": "text"}
 //   {"menuBlocked": true}             the browser's context menu was suppressed
@@ -38,14 +42,18 @@ const script = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
     return lines.join('\n');
   });
   // Cell geometry, and the screen position of the last line showing text.
-  const locate = async (text) => {
+  const locate = async (text, first) => {
     const geo = await page.evaluate(() => {
       const r = document.querySelector('.xterm-screen').getBoundingClientRect();
       return { x: r.x, y: r.y, cw: r.width / window.term.cols, ch: r.height / window.term.rows };
     });
     const lines = (await screen()).split('\n');
     let row = -1;
-    lines.forEach((l, i) => { if (l.includes(text) && !l.includes('echo ')) row = i; });
+    lines.forEach((l, i) => {
+      // first: any line (the sidebar shares rows with the pane); otherwise the
+      // last line, skipping the command that echoed the text.
+      if (first ? row < 0 && l.includes(text) : l.includes(text) && !l.includes('echo ')) row = i;
+    });
     if (row < 0) throw new Error('not on screen: ' + text);
     const col = lines[row].indexOf(text);
     return { y: geo.y + (row + 0.5) * geo.ch, x0: geo.x + (col + 0.5) * geo.cw,
@@ -82,6 +90,29 @@ const script = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
         await page.mouse.down();
         await page.mouse.move(at.x1, at.y, { steps: 8 });
         await page.mouse.up();
+      } else if (s.click !== undefined) {
+        // The sidebar redraws while connections come up: locate right
+        // before each click, and with "until", click until the result holds.
+        const deadline = t0 + (s.timeout || 30) * 1000;
+        for (;;) {
+          let at = null;
+          try { at = await locate(s.click, true); } catch (e) {
+            if (Date.now() > deadline) throw e;
+          }
+          if (at) await page.mouse.click(at.x0, at.y);
+          if (s.until === undefined && at) break;
+          if (at) {
+            await page.waitForTimeout(500);
+            let held = 0;
+            while (held < 2000 && (await screen()).includes(s.until)) {
+              await page.waitForTimeout(250);
+              held += 250;
+            }
+            if (held >= 2000) break;
+          }
+          if (Date.now() > deadline) { good = false; break; }
+          await page.waitForTimeout(250);
+        }
       } else if (s.rightclick !== undefined) {
         const at = await locate(s.rightclick);
         await page.mouse.click(at.x0, at.y, { button: 'right' });

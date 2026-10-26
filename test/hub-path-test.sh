@@ -47,6 +47,12 @@ cleanup() {
   [[ -n "${router_pid}" ]] && kill "${router_pid}" 2>/dev/null || true
   docker rm -f "${NAME}" >/dev/null 2>&1 || true
   pkill -f -- "ate-target-actor: ${ATESPACE}/" 2>/dev/null || true
+  # The hub's herdr server detaches from every client; stop the one using this
+  # test's HOME.
+  local pid
+  for pid in $(pgrep -x herdr 2>/dev/null); do
+    tr '\0' '\n' <"/proc/${pid}/environ" 2>/dev/null | grep -qx "HOME=${WORK}/hub-home" && kill "${pid}" 2>/dev/null
+  done
   if [[ "${KEEP:-0}" == 1 ]]; then echo "kept ${WORK}"; else rm -rf "${WORK}"; fi
 }
 trap cleanup EXIT
@@ -87,8 +93,20 @@ mkleaf rogue podidentity "URI:spiffe://cluster.local/ns/elsewhere/sa/intruder"
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/kubectl-ate" <<'EOF'
 #!/bin/sh
+# Actors and egress policies other than luna's live as files in STUB_STATE.
 echo "kubectl-ate $*" >>"${STUB_LOG}"
+name=""; file=""; prev=""
+for a in "$@"; do
+  case "${prev}" in actor|egress-policy) [ -z "${name}" ] && name="${a}" ;; -f) file="${a}" ;; esac
+  prev="${a}"
+done
 case "$*" in
+  *"get actor "*) [ "${name}" = luna ] || [ -e "${STUB_STATE}/actor.${name}" ] || { echo "not found" >&2; exit 1; } ;;
+  *"create actor "*) touch "${STUB_STATE}/actor.${name}" ;;
+  *"delete actor "*) rm -f "${STUB_STATE}/actor.${name}" ;;
+  *"get egress-policy "*) [ -e "${STUB_STATE}/egress.${name}" ] && cat "${STUB_STATE}/egress.${name}" ;;
+  *"create egress-policy "*) cp "${file}" "${STUB_STATE}/egress.${name}" ;;
+  *"delete egress-policy "*) rm -f "${STUB_STATE}/egress.${name}" ;;
   *"get actors"*)
     state=ACTOR_STATE_RUNNING
     [ "$(docker inspect -f '{{.State.Paused}}' "${ACTOR_CONTAINER}")" = true ] && state=ACTOR_STATE_SUSPENDED
@@ -99,7 +117,8 @@ esac
 exit 0
 EOF
 chmod +x "${WORK}/bin/kubectl-ate"
-export STUB_LOG="${WORK}/kubectl-ate.log" ACTOR_CONTAINER="${NAME}"; : >"${STUB_LOG}"
+export STUB_LOG="${WORK}/kubectl-ate.log" STUB_STATE="${WORK}/ate-state" ACTOR_CONTAINER="${NAME}"
+: >"${STUB_LOG}"; mkdir -p "${STUB_STATE}"
 echo token >"${WORK}/token"
 
 export PATH="${WORK}/bin:${KIT_DIR}/hub:${PATH}"
@@ -137,6 +156,8 @@ python3 "${KIT_DIR}/test/fake_router.py" --listen "127.0.0.1:${ROUTER_PORT}" \
   --cert "${pki}/router.crt" --key "${pki}/router.key" --client-ca "${pki}/podidentity.crt" \
   --allow "${HUB_ID}" --actor "${ATESPACE}/luna=ws://127.0.0.1:${ACTOR_PORT}/" \
   --container "${ATESPACE}/luna=${NAME}" \
+  --actor "${ATESPACE}/mars=ws://127.0.0.1:${ACTOR_PORT}/" --container "${ATESPACE}/mars=${NAME}" \
+  --actor "${ATESPACE}/venus=ws://127.0.0.1:${ACTOR_PORT}/" --container "${ATESPACE}/venus=${NAME}" \
   >"${WORK}/router.log" 2>&1 &
 router_pid=$!
 for _ in $(seq 1 30); do
@@ -243,6 +264,10 @@ hubctl status 2>/dev/null | grep -q 'keeper luna (pid [0-9]*): awake' \
   && ok "hubctl status shows the keeper awake" || bad "hubctl status: $(hubctl status 2>&1 | tail -n 2)"
 
 step "10. a browser is a second client, through the hub's web terminal"
+# A new client may open on the Local workspace, or switch to it while its own
+# connection to luna comes up; these steps pick luna's shell workspace in the
+# sidebar until herdr shows luna as the active machine and keeps it.
+open_luna='{"wait": "· ~", "timeout": 60}, {"click": "· ~", "until": "new · luna", "timeout": 30}'
 web_run() { # name, then the steps as JSON
   printf '%s' "$2" >"${WORK}/$1.json"
   WEB_SCREENSHOT="${WORK}/$1.png" node "${KIT_DIR}/test/web-client.js" \
@@ -251,7 +276,7 @@ web_run() { # name, then the steps as JSON
 # shellcheck disable=SC2016 # expanded by the shell on luna
 # Wait for luna's pane itself (step 9's output), not just the sidebar: until
 # the new client's connection to luna is up, keys have no pane to go to.
-if web_run web-type '[{"wait": "always-on-42", "timeout": 60},
+if web_run web-type '['"${open_luna}"', {"wait": "always-on-42", "timeout": 60},
     {"type": "echo browser-$((6*7))"}, {"keys": ["Enter"]}, {"wait": "browser-42", "timeout": 30}]'; then
   ok "typed in the browser; the command ran on luna"
 else
@@ -269,7 +294,7 @@ start=$SECONDS
 until [[ "$(paused)" == true ]] || (( SECONDS - start > 90 )); do sleep 2; done
 [[ "$(paused)" == true ]] && ok "luna suspended again after $((SECONDS - start))s" || bad "luna never suspended"
 # shellcheck disable=SC2016 # expanded by the shell on luna
-if web_run web-wake '[{"wait": "browser-42", "timeout": 60},
+if web_run web-wake '['"${open_luna}"', {"wait": "browser-42", "timeout": 60},
     {"type": "echo morning-$((6*7))"}, {"keys": ["Enter"]}, {"wait": "morning-42", "timeout": 60}]'; then
   ok "a new tab on a suspended luna works: luna woke and ran the command"
 else
@@ -283,7 +308,7 @@ step "12. copy, paste and right-click in the browser"
 # browser's clipboard, keeps the browser's menu off herdr's, and makes ctrl+v
 # paste.
 # shellcheck disable=SC2016 # expanded by the shell on luna
-if web_run web-clip '[{"wait": "morning-42", "timeout": 60},
+if web_run web-clip '['"${open_luna}"', {"wait": "morning-42", "timeout": 60},
     {"drag": "morning-42"}, {"clipboard": "morning-42"},
     {"rightclick": "morning-42"}, {"wait": "Split right", "timeout": 5}, {"menuBlocked": true},
     {"keys": ["Escape"]}, {"setClipboard": "echo pasted-$((6*7))"},
@@ -292,6 +317,41 @@ if web_run web-clip '[{"wait": "morning-42", "timeout": 60},
 else
   bad "browser: $(tail -n 30 "${WORK}/web-clip.log")"
 fi
+
+step "13. hubctl create and delete: one command each, from inside the hub"
+# mars and venus are routed to luna's container; the stub keeps the rest.
+has_machine() { herdr machine list --json | python3 -c 'import json,sys; sys.exit(0 if any(r["label"] == sys.argv[1] for r in json.load(sys.stdin)) else 1)' "$1"; }
+export HUB_EGRESS_POLICY="${WORK}/no-such-policy.yaml"
+if out="$(hubctl create mars 2>&1)"; then
+  bad "create without a policy file succeeded"
+else
+  grep -q "no egress policy at" <<<"${out}" && ok "no default policy installed: create stops before touching anything" \
+    || bad "create without a policy: ${out}"
+fi
+grep -q "create actor mars" "${STUB_LOG}" && bad "an actor was created anyway" || true
+ATESPACE="${ATESPACE}" CREDENTIAL_URI="ate-secret://k8s.io/default/herdr-agents-secrets/anthropic/api-key" python3 - \
+  "${KIT_DIR}/manifests/egress-policy.yaml.tmpl" >"${WORK}/egress-policy.yaml" <<'PY'
+import os, re, sys
+print(re.sub(r"\$\{([A-Z0-9_]+)\}", lambda m: os.environ[m.group(1)], open(sys.argv[1]).read()), end="")
+PY
+export HUB_EGRESS_POLICY="${WORK}/egress-policy.yaml" HUB_TEMPLATE=herdr-agent
+if out="$(hubctl create mars 2>&1)"; then ok "hubctl create mars"; else bad "hubctl create mars: ${out}"; fi
+grep -q "create actor mars -a ${ATESPACE} --template herdr-agent" "${STUB_LOG}" \
+  && ok "actor created in the hub's atespace from the kit's template" || bad "no create actor call: $(tail -n 5 "${STUB_LOG}")"
+grep -q "credentialUri: ate-secret://k8s.io/" "${STUB_STATE}/egress.mars" 2>/dev/null \
+  && ok "default egress policy applied (api.anthropic.com, injected key)" || bad "egress policy: $(cat "${STUB_STATE}/egress.mars" 2>&1)"
+has_machine mars && ok "mars saved as a herdr machine" || bad "no mars machine"
+before="$(grep -c "create " "${STUB_LOG}")"
+hubctl create mars >/dev/null 2>&1 && [[ "$(grep -c "create " "${STUB_LOG}")" == "${before}" ]] \
+  && ok "re-running create changes nothing" || bad "second create made new calls"
+printf 'rules:\n- https:\n    hostnames: ["api.anthropic.com", "api.github.com"]\n' >"${WORK}/custom.yaml"
+hubctl create venus --policy "${WORK}/custom.yaml" >/dev/null 2>&1 && grep -q "api.github.com" "${STUB_STATE}/egress.venus" \
+  && ok "--policy FILE replaces the default" || bad "--policy not applied"
+hubctl delete venus >/dev/null 2>&1 || true
+hubctl delete mars >/dev/null 2>&1 || true
+has_machine mars && bad "mars machine still saved" || ok "delete removed the machine"
+[[ ! -e "${STUB_STATE}/egress.mars" && ! -e "${STUB_STATE}/actor.mars" ]] \
+  && ok "delete removed the egress policy and the actor" || bad "mars left behind: $(ls "${STUB_STATE}")"
 
 echo; echo "lifecycle calls made by the hub (polls omitted):"; grep -v "get actors" "${STUB_LOG}" | sed 's/^/  /' || true
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"

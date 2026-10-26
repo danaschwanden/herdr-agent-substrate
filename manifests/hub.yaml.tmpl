@@ -4,7 +4,10 @@
 #
 # Placeholders (rendered by host/herdr-substrate.sh hub):
 #   ${HUB_NAMESPACE}  ${HUB_IMAGE}  ${ATESPACE}  ${IDLE_SECONDS}  ${POLL_SECONDS}
-#   ${HUB_WEB_ADDR}  ${HUB_WEB_AUTH_HEADER}
+#   ${HUB_WEB_ADDR}  ${HUB_WEB_AUTH_HEADER}  ${TEMPLATE_NAME}
+#
+# `hub` also creates ConfigMap herdr-hub-egress-policy: the default egress
+# policy for `hubctl create`, rendered from egress-policy.yaml.tmpl.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -105,6 +108,9 @@ spec:
           value: "${POLL_SECONDS}"
         # Web terminal (ttyd). 127.0.0.1: only `kubectl port-forward` reaches
         # it. The production guides set 0.0.0.0 behind IAP or oauth2-proxy.
+        # `hubctl create`: the template new actors come from.
+        - name: HUB_TEMPLATE
+          value: "${TEMPLATE_NAME}"
         - name: HUB_WEB_ADDR
           value: "${HUB_WEB_ADDR}"
         - name: HUB_WEB_AUTH_HEADER
@@ -131,10 +137,19 @@ spec:
         - name: api-token
           mountPath: /var/run/ate/api-token
           readOnly: true
+        - name: egress-policy
+          mountPath: /etc/herdr-hub/policy
+          readOnly: true
       volumes:
       - name: home
         persistentVolumeClaim:
           claimName: herdr-hub-home
+      # Default egress policy for `hubctl create` (written by `hub`). Optional,
+      # so the hub starts without it; updates reach the pod within a minute.
+      - name: egress-policy
+        configMap:
+          name: herdr-hub-egress-policy
+          optional: true
       # Client certificate for the router's mTLS listener, from substrate's
       # podidentity signer (same projected source substrate's own pods use).
       - name: identity

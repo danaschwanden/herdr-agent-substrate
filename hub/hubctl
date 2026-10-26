@@ -17,6 +17,11 @@ ATE_API_TOKEN="${ATE_API_TOKEN:-/var/run/ate/api-token/token}"
 IDLE_SECONDS="${IDLE_SECONDS:-300}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
 KEEPER_RUN="${HERDR_KEEPER_RUN:-/tmp/herdr-keepers}"
+# For `create`: the kit's ActorTemplate, and its default egress policy, which
+# `host/herdr-substrate.sh hub` renders from manifests/egress-policy.yaml.tmpl
+# (with the cluster's CREDENTIAL_URI) into a ConfigMap mounted here.
+HUB_TEMPLATE="${HUB_TEMPLATE:-herdr-agent}"
+HUB_EGRESS_POLICY="${HUB_EGRESS_POLICY:-/etc/herdr-hub/policy/egress-policy.yaml}"
 STATE_DIR="${HOME}/.herdr-hub"
 mkdir -p "${STATE_DIR}"
 # hubctl's own ssh and herdr --machine calls go straight to the actor, never
@@ -98,6 +103,55 @@ cmd_add() {
     log "machine ${name} already saved"
   else
     herdr machine add "ate-${name}" --label "${name}"
+  fi
+}
+
+# create NAME [--policy FILE]: actor, egress policy and herdr machine in one go.
+# Each part is skipped when it already exists, so a failed create can be re-run.
+cmd_create() {
+  local name="" policy="${HUB_EGRESS_POLICY}" current
+  while (( $# )); do
+    case "$1" in
+      --policy) [[ -n "${2:-}" ]] || die "--policy needs a file"; policy="$2"; shift 2 ;;
+      --policy=*) policy="${1#--policy=}"; shift ;;
+      -*) die "unknown option $1 (usage: hubctl create <actor> [--policy FILE])" ;;
+      *) [[ -z "${name}" ]] || die "one actor at a time"; name="$1"; shift ;;
+    esac
+  done
+  [[ -n "${name}" ]] || die "usage: hubctl create <actor> [--policy FILE]"
+  validate_name "${name}"
+  [[ -s "${policy}" ]] || die "no egress policy at ${policy}; pass --policy FILE, or run 'host/herdr-substrate.sh hub' to install the default"
+
+  if ate get actor "${name}" -a "${ATESPACE}" >/dev/null 2>&1; then
+    log "actor ${ATESPACE}/${name} exists"
+  else
+    log "creating actor ${ATESPACE}/${name} from template ${HUB_TEMPLATE}"
+    ate create actor "${name}" -a "${ATESPACE}" --template "${HUB_TEMPLATE}" >/dev/null
+  fi
+  # A missing egress policy prints nothing and exits 0.
+  current="$(ate get egress-policy "${name}" -a "${ATESPACE}" -o json 2>/dev/null)" \
+    || die "could not read the egress policy of ${ATESPACE}/${name}"
+  if [[ -n "${current}" ]]; then
+    log "egress policy of ${name} exists; left as it is"
+  else
+    log "egress policy for ${name}: ${policy}"
+    ate create egress-policy "${name}" -a "${ATESPACE}" -f "${policy}" >/dev/null
+  fi
+  cmd_add "${name}"
+  log "created ${name}; it shows up in herdr's sidebar"
+}
+
+# delete NAME: the reverse of create. The machine goes first, so no client
+# reconnects (and so resumes) the actor while it is being deleted.
+cmd_delete() {
+  local name="${1:?usage: hubctl delete <actor>}"; validate_name "${name}"
+  cmd_remove "${name}"
+  ate delete egress-policy "${name}" -a "${ATESPACE}" >/dev/null 2>&1 || true
+  if ate get actor "${name}" -a "${ATESPACE}" >/dev/null 2>&1; then
+    ate delete actor "${name}" -a "${ATESPACE}" >/dev/null
+    log "deleted actor ${ATESPACE}/${name} and its snapshot"
+  else
+    log "actor ${ATESPACE}/${name} does not exist"
   fi
 }
 
@@ -246,8 +300,12 @@ usage() {
   cat <<EOF
 Usage: hubctl <command> [args]   (atespace: ${ATESPACE})
 
+  create <actor> [--policy FILE]
+                           new actor from ${HUB_TEMPLATE}, its egress policy (default:
+                           only api.anthropic.com, key injected) and herdr machine
+  delete <actor>           remove the machine, the egress policy and the actor
   add <actor>              pin the actor's host key and save it as herdr machine <actor>
-  remove <actor>           forget the herdr machine
+  remove <actor>           forget the herdr machine (the actor stays)
   suspend <actor> [--force] park attached clients' keepers, cut tunnels, suspend the actor
   resume <actor>           resume the actor and reconnect attached clients' keepers
   idle-watch               loop: suspend actors idle for IDLE_SECONDS (runs as a service)
@@ -261,6 +319,8 @@ EOF
 main() {
   local cmd="${1:-help}"; shift || true
   case "${cmd}" in
+    create) cmd_create "$@" ;;
+    delete) cmd_delete "$@" ;;
     add) cmd_add "$@" ;;
     remove) cmd_remove "$@" ;;
     suspend) cmd_suspend "$@" ;;

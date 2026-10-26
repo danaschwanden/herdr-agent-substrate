@@ -278,6 +278,21 @@ fi
 [[ "$(grep -c "RESUME ${ATESPACE}/luna" "${WORK}/router.log")" -ge 2 ]] \
   && ok "the router resumed luna for the browser" || bad "no second RESUME"
 
+step "12. copy, paste and right-click in the browser"
+# herdr copies a mouse selection with OSC 52; hub/herdr-web.js puts it on the
+# browser's clipboard, keeps the browser's menu off herdr's, and makes ctrl+v
+# paste.
+# shellcheck disable=SC2016 # expanded by the shell on luna
+if web_run web-clip '[{"wait": "morning-42", "timeout": 60},
+    {"drag": "morning-42"}, {"clipboard": "morning-42"},
+    {"rightclick": "morning-42"}, {"wait": "Split right", "timeout": 5}, {"menuBlocked": true},
+    {"keys": ["Escape"]}, {"setClipboard": "echo pasted-$((6*7))"},
+    {"keys": ["Control+v", "Enter"]}, {"wait": "pasted-42", "timeout": 30}]'; then
+  ok "a selection lands on the clipboard; herdr's menu opens without the browser's; ctrl+v pastes into luna"
+else
+  bad "browser: $(tail -n 30 "${WORK}/web-clip.log")"
+fi
+
 echo; echo "lifecycle calls made by the hub (polls omitted):"; grep -v "get actors" "${STUB_LOG}" | sed 's/^/  /' || true
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 (( fail == 0 ))

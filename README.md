@@ -623,8 +623,18 @@ flowchart LR
   through that sign-in controls every actor, as with `attach`.
 - **Always on, here too.** Browser clients go through the same keepers. A suspended actor shows online, and
   opening the page or typing wakes it.
-- **Keys and copy-paste.** Keys go to herdr, including its `ctrl+b` prefix, except the ones the browser keeps for
-  itself, such as `ctrl+w` and `ctrl+t`. Copy and paste go through the browser's clipboard.
+- **Copy, paste and right-click.** The hub serves ttyd's page with a small script added (`hub/herdr-web.js`), so
+  the browser behaves like a desktop terminal running herdr:
+  - **Copy:** select with the mouse as in herdr anywhere. herdr copies the selection (as OSC 52), the script puts
+    it on your clipboard, and "Copied" shows in the corner.
+  - **Paste:** `cmd+v` on macOS, `ctrl+v` or `ctrl+shift+v` elsewhere. It arrives as one paste, not as typing.
+  - **Right-click** opens herdr's menu; the browser's own menu stays out of the way.
+
+  Clipboard access needs a secure page: `http://localhost` (as `web` uses) or `https`. Tested in Chromium. Other
+  browsers may refuse a copy that doesn't follow a click closely enough (Safari is the strictest); the corner then
+  says the browser blocked it.
+- **Keys.** Keys go to herdr, including its `ctrl+b` prefix, except the ones the browser keeps for itself, such
+  as `ctrl+w` and `ctrl+t`.
 - **Dropped connections.** ttyd pings every 5 seconds, which keeps proxies from closing an idle tab. If the
   connection drops anyway (laptop asleep, `web` stopped), the page offers to reconnect, which starts a fresh
   herdr client; nothing is lost on the hub or the actors.
@@ -1218,6 +1228,7 @@ fails in ways that look unrelated.
 |---|---|
 | `actor/Dockerfile`, `actor/entrypoint.sh`, `actor/sshd_config`, `actor/herdr-config.toml` | the agent actor: Claude Code and a herdr server behind sshd behind websocat :80; pinned binaries; Claude onboarding pre-completed |
 | `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge and the web terminal (ttyd); takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
+| `hub/herdr-web.js`, `hub/herdr-web-index` | the web terminal's copy, paste and right-click handling, and the script that adds it to ttyd's page when the hub starts |
 | `hub/ate-wss-proxy` | SSH ProxyCommand: mTLS WebSocket to atenet-router with the pod's SPIFFE certificate |
 | `hub/hubctl` | add/remove machines, suspend/resume (parking keepers), idle bridge, `ate` passthrough |
 | `hub/herdr-keeper`, `hub/ssh` | keeps each machine connection looking online while its actor is suspended; the `ssh` wrapper hands herdr's bridges to it |
@@ -1262,7 +1273,8 @@ fails in ways that look unrelated.
 | Suspended: luna shows online for 45 s of health checks; nothing reaches the router; a resize doesn't wake it | same | pass |
 | A typed command wakes it: router resumes the actor, keeper rejoins the same session, output on screen | same | container up in 0.16 s, session resumed in 0.38 s |
 | Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor | `test/keeper-test.py` | 23/23 |
-| Web terminal: ttyd in the hub listens on loopback only; headless Chromium types a command that runs on luna and shows in the tmux client too; closing the tab ends its herdr client; a new tab on a suspended luna wakes it | `test/hub-path-test.sh` steps 1, 10, 11 (30/30 in all) | pass |
+| Web terminal: ttyd in the hub listens on loopback only; headless Chromium types a command that runs on luna and shows in the tmux client too; closing the tab ends its herdr client; a new tab on a suspended luna wakes it | `test/hub-path-test.sh` steps 1, 10, 11 (31/31 in all) | pass |
+| Web terminal: a mouse selection reaches the clipboard, right-click opens herdr's menu with the browser's suppressed, `ctrl+v` pastes into luna. ttyd's own page does none of the three | same, step 12; the same checks against ttyd's default page | pass; default page fails all three |
 | `web`: forwards, checks the page answers, stops the port-forward on exit; reports a proxy-only hub (407) clearly | script run against a stub kubectl and ttyd | pass |
 | Scripts | `shellcheck` | clean |
 
@@ -1439,6 +1451,8 @@ the hub.
 | A machine shows `reconnecting` after a long suspend | the resume took longer than `HERDR_KEEPER_WAKE_TIMEOUT` (180 s), or the actor lost its session (reverted, crashed, or the anchor's 15-minute cleanup ran). herdr reconnects by itself; the keeper log in the hub (`/tmp/herdr-keepers/<name>/`) says which |
 | `web`: "this hub image has no web terminal" | the hub runs an image from before ttyd was added: `hub-image` (or a newer `HUB_IMAGE`), then `hub` |
 | `web`: "port-forward failed" | something else uses local port 7681: `WEB_PORT=7682 host/herdr-substrate.sh web` |
+| Web: selecting text doesn't copy, or says "The browser blocked the copy" | the page isn't on `localhost` or `https` (browsers only allow clipboard access there), or Safari refused. Use `web`'s `http://localhost` URL or the shared `https` link; Chrome and Edge allow it |
+| Web: the browser's menu still covers herdr's on right-click | the hub started without its page (`logs` shows "could not build the web page"), or runs an older image: `hub-image`, then `hub` |
 | The web page says "Press ⏎ to Reconnect" | the WebSocket dropped (laptop asleep, `web` stopped, proxy timeout). Restart `web` if needed and press Enter: a fresh herdr client starts, nothing on the hub or the actors is lost |
 | zsh: a pasted command waits at `quote>` | it contained a `#` comment with an apostrophe; press Ctrl-C. `setopt interactive_comments` in `~/.zshrc` makes zsh accept comments |
 
@@ -1469,6 +1483,8 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   - **Idle detection:** idle means no working or blocked agent *and* no input, and only running actors are polled.
   - **Older images:** actors without the anchor fall back to a plain relay and aren't suspended under an
     attached client.
+- **herdr in the browser:** copying a selection, pasting with `ctrl+v`, and herdr's right-click menu work in the
+  browser (`hub/herdr-web.js`). Before, ttyd ignored herdr's copies and the browser's menu covered herdr's.
 - **herdr in the browser:** the hub runs ttyd on its loopback, and the new `web` command port-forwards to it and
   opens the page. Each guide's step 14 adds a shared link behind sign-in: IAP on GKE, oauth2-proxy elsewhere.
 - **Container `/tmp`:** the actor entrypoint sets `/tmp` and `/var/tmp` to mode 1777, which Claude Code needs

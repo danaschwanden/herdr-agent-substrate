@@ -92,6 +92,16 @@ else
             -t titleFixed=herdr -t disableLeaveAlert=true)
   [[ "${HUB_WEB_ADDR}" == "0.0.0.0" ]] || web_args+=(-i "${HUB_WEB_ADDR}")
   [[ -z "${HUB_WEB_AUTH_HEADER:-}" ]] || web_args+=(-H "${HUB_WEB_AUTH_HEADER}")
+  # ttyd's page plus hub/herdr-web.js: herdr's copy (OSC 52) reaches the
+  # browser's clipboard, its right-click menu isn't covered by the browser's,
+  # and ctrl+v pastes.
+  web_index="${HOME}/.herdr-hub/web-index.html"
+  mkdir -p "${HOME}/.herdr-hub"
+  if herdr-web-index "${web_index}"; then
+    web_args+=(-I "${web_index}")
+  else
+    log "WARNING: could not build the web page; serving ttyd's default (no copy or right-click fixes)"
+  fi
   supervise web ttyd "${web_args[@]}" herdr &
   log "web terminal on ${HUB_WEB_ADDR}:${HUB_WEB_PORT}"
 fi

@@ -7,6 +7,13 @@
 //   {"keys": ["Control+b", "w"]}      key presses (Playwright key names)
 //   {"type": "echo hi"}               typed text
 //   {"sleep": 1}
+//   {"drag": "text"}                  select text with the mouse (herdr's own
+//                                     selection; the last line with it that
+//                                     isn't the command echoing it)
+//   {"rightclick": "text"}            right-click on that text
+//   {"clipboard": "text"}             until the clipboard holds exactly this
+//   {"setClipboard": "text"}
+//   {"menuBlocked": true}             the browser's context menu was suppressed
 // Prints one JSON line per step, {"step": i, "ok": bool, "ms": n}, and the
 // final screen on failure. Reads the screen from xterm.js's buffer
 // (ttyd exposes the terminal as window.term), not from pixels.
@@ -18,7 +25,9 @@ const script = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
 
 (async () => {
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+  const context = await browser.newContext({
+    viewport: { width: 1400, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
+  const page = await context.newPage();
   const screen = () => page.evaluate(() => {
     const b = window.term.buffer.active;
     const lines = [];
@@ -28,10 +37,29 @@ const script = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
     }
     return lines.join('\n');
   });
+  // Cell geometry, and the screen position of the last line showing text.
+  const locate = async (text) => {
+    const geo = await page.evaluate(() => {
+      const r = document.querySelector('.xterm-screen').getBoundingClientRect();
+      return { x: r.x, y: r.y, cw: r.width / window.term.cols, ch: r.height / window.term.rows };
+    });
+    const lines = (await screen()).split('\n');
+    let row = -1;
+    lines.forEach((l, i) => { if (l.includes(text) && !l.includes('echo ')) row = i; });
+    if (row < 0) throw new Error('not on screen: ' + text);
+    const col = lines[row].indexOf(text);
+    return { y: geo.y + (row + 0.5) * geo.ch, x0: geo.x + (col + 0.5) * geo.cw,
+             x1: geo.x + (col + text.length - 0.5) * geo.cw };
+  };
+  const clipboard = () => page.evaluate(() => navigator.clipboard.readText());
   let ok = true;
   try {
     await page.goto(url);
     await page.waitForFunction(() => window.term && window.term.rows > 0, null, { timeout: 15000 });
+    await page.evaluate(() => {
+      window.__menus = [];
+      window.addEventListener('contextmenu', (e) => window.__menus.push(e.defaultPrevented));
+    });
     await page.locator('.xterm').click();
     for (const [i, s] of script.entries()) {
       const t0 = Date.now();
@@ -48,6 +76,26 @@ const script = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
         await page.keyboard.type(s.type, { delay: 20 });
       } else if (s.sleep) {
         await page.waitForTimeout(s.sleep * 1000);
+      } else if (s.drag !== undefined) {
+        const at = await locate(s.drag);
+        await page.mouse.move(at.x0, at.y);
+        await page.mouse.down();
+        await page.mouse.move(at.x1, at.y, { steps: 8 });
+        await page.mouse.up();
+      } else if (s.rightclick !== undefined) {
+        const at = await locate(s.rightclick);
+        await page.mouse.click(at.x0, at.y, { button: 'right' });
+      } else if (s.setClipboard !== undefined) {
+        await page.evaluate((t) => navigator.clipboard.writeText(t), s.setClipboard);
+      } else if (s.clipboard !== undefined) {
+        const deadline = t0 + (s.timeout || 5) * 1000;
+        while ((await clipboard()) !== s.clipboard) {
+          if (Date.now() > deadline) { good = false; break; }
+          await page.waitForTimeout(100);
+        }
+      } else if (s.menuBlocked !== undefined) {
+        const menus = await page.evaluate(() => window.__menus);
+        good = menus.length > 0 && menus.every((m) => m === s.menuBlocked);
       }
       console.log(JSON.stringify({ step: i, ok: good, ms: Date.now() - t0, ...s }));
       if (!good) { ok = false; break; }

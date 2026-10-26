@@ -45,13 +45,14 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/herdr /usr/local/bin/websocat /usr/local/bin/ttyd
 
 COPY bin/linux-${TARGETARCH}/kubectl-ate /usr/local/bin/kubectl-ate
-COPY ate-wss-proxy hubctl herdr-keeper /usr/local/bin/
+COPY ate-wss-proxy hubctl herdr-keeper herdr-web-index /usr/local/bin/
+COPY herdr-web.js /usr/local/share/herdr-hub/herdr-web.js
 # herdr runs `ssh` from PATH; this wrapper hands ate-* client bridges to
 # herdr-keeper and everything else to /usr/bin/ssh.
 COPY ssh /usr/local/lib/herdr-hub/bin/ssh
 COPY entrypoint.sh /usr/local/bin/herdr-hub-entrypoint
 COPY herdr-config.toml /etc/herdr-hub/herdr-config.toml
-RUN chmod 0755 /usr/local/bin/herdr-keeper /usr/local/lib/herdr-hub/bin/ssh \
+RUN chmod 0755 /usr/local/bin/herdr-keeper /usr/local/bin/herdr-web-index /usr/local/lib/herdr-hub/bin/ssh \
  && chmod 0755 /usr/local/bin/kubectl-ate /usr/local/bin/ate-wss-proxy \
       /usr/local/bin/hubctl /usr/local/bin/herdr-hub-entrypoint
 

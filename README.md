@@ -66,7 +66,7 @@ flowchart TB
     end
     podcert["podcertificate-controller<br/>issues pod identities"]
     subgraph hubns["herdr-hub"]
-      hub["hub pod<br/>herdr client, a herdr-keeper per machine,<br/>hubctl idle-watch, ate-wss-proxy, SSH key on PVC"]
+      hub["hub pod<br/>herdr client, a herdr-keeper per machine,<br/>hubctl idle-watch, ate-wss-proxy, ttyd,<br/>SSH key on PVC"]
     end
     subgraph agents["herdr-agents: WorkerPool"]
       subgraph worker["worker pod"]
@@ -77,7 +77,7 @@ flowchart TB
   end
   anthropic(["api.anthropic.com"])
 
-  you -->|"attach: kubectl exec"| hub
+  you -->|"attach: kubectl exec<br/>web: browser, port-forward"| hub
   script -->|"kubectl, kubectl ate"| api
   script --> buildx -->|"push images"| registry
   registry -.->|"pull"| worker
@@ -102,7 +102,8 @@ flowchart TB
   the egress gateway (the only way out), atelet (snapshots, stored in rustfs) and the credential provider.
 - **The hub** is an ordinary pod: the herdr client for every actor and the lifecycle controller. A
   `herdr-keeper` carries each of the client's machine connections, so a suspended actor still looks online
-  ([Always-on machines](#always-on-machines)).
+  ([Always-on machines](#always-on-machines)). ttyd serves the same herdr TUI to a browser
+  ([herdr in the browser](#herdr-in-the-browser)).
 - **Each actor** runs in a gVisor sandbox on a worker pod: a herdr server behind sshd behind websocat, with Claude
   Code in its panes. Its `herdr-anchor` holds the hub's session to that server across suspends. Its only egress is `api.anthropic.com`, and the real API key is added on the way out.
 
@@ -305,6 +306,16 @@ in herdr's sidebar.
 
 Detach with `ctrl+b` then `q`. Claude and the actor keep running.
 
+Or use the same TUI in your browser:
+
+```bash
+host/herdr-substrate.sh web
+```
+
+It opens <http://localhost:7681/> (on Linux, or if nothing opens, open it yourself). Each browser tab is its own
+herdr client, next to any `attach`. `ctrl+c` in the terminal stops it; the actors keep running. See
+[herdr in the browser](#herdr-in-the-browser).
+
 ### 14. Suspend and resume
 
 The hub suspends an actor after 5 minutes (`IDLE_SECONDS`) with no working or blocked agent and no input,
@@ -466,7 +477,7 @@ sequenceDiagram
 | Count | many; fewer workers than actors | one |
 | Busy when | an agent is working | always, but tiny: a 30 s poll loop |
 | Sleeps | suspended after `IDLE_SECONDS` with no working or blocked agent and no input, even with a client attached | doesn't; scale it to 0 if you like, its state is on its volume |
-| Wakes | input or a request from a herdr client, any other connection through the router, or `resume` | `attach` / `kubectl exec` |
+| Wakes | input or a request from a herdr client, any other connection through the router, or `resume` | `attach`, `web` / `kubectl exec` |
 | State | agent sessions, in memory snapshots | herdr machine list, SSH key, known_hosts, idle timers (1 GiB PVC) |
 | Holds | nothing privileged; a placeholder API key | the SSH key to every actor, atespace editor on ate-api, a router identity |
 
@@ -585,6 +596,41 @@ stateDiagram-v2
   herdr's probes when a client starts. Whatever woke it, the idle bridge suspends it again after `IDLE_SECONDS`.
 - `delete NAME` works from any state.
 
+### herdr in the browser
+
+The hub runs [ttyd](https://github.com/tsl0922/ttyd), a small web terminal that serves the herdr TUI to a
+browser. Each tab is its own herdr client, started for that tab and ended when it closes, just like each
+`attach`. All clients share the hub's herdr server: the same machines, workspaces and panes, and a command typed
+in one shows up in the others.
+
+```mermaid
+flowchart LR
+  B1(["browser tab"]) & B2(["browser tab"]) -->|"WebSocket"| PF["kubectl port-forward<br/>or a sign-in proxy"]
+  PF --> T["ttyd<br/>hub pod, :7681"]
+  T -->|"one herdr per tab"| C["herdr clients"]
+  A(["attach"]) -->|"kubectl exec"| C
+  C --> S["hub's herdr server<br/>saved machines"]
+  S -->|"keepers, path 3"| X["actors"]
+```
+
+- **Who can reach it.** ttyd listens only on the pod's loopback. The `web` command reaches it with
+  `kubectl port-forward` as your kubeconfig identity, so it needs the same kind of access as `attach`
+  (`pods/portforward` instead of `pods/exec` in `herdr-hub`). Nothing else in the cluster or on the network can
+  connect, and ttyd refuses WebSockets opened from another site's pages.
+- **A shared link.** For a URL operators open without kubectl, the production guides put ttyd behind sign-in:
+  [IAP on GKE](docs/production-gke.md#14-browser-access) and
+  [oauth2-proxy on upstream Kubernetes](docs/production-kubernetes.md#14-browser-access). Anyone who gets
+  through that sign-in controls every actor, as with `attach`.
+- **Always on, here too.** Browser clients go through the same keepers. A suspended actor shows online, and
+  opening the page or typing wakes it.
+- **Keys and copy-paste.** Keys go to herdr, including its `ctrl+b` prefix, except the ones the browser keeps for
+  itself, such as `ctrl+w` and `ctrl+t`. Copy and paste go through the browser's clipboard.
+- **Dropped connections.** ttyd pings every 5 seconds, which keeps proxies from closing an idle tab. If the
+  connection drops anyway (laptop asleep, `web` stopped), the page offers to reconnect, which starts a fresh
+  herdr client; nothing is lost on the hub or the actors.
+- **Turning it off.** `kubectl -n herdr-hub set env deployment/herdr-hub HUB_WEB=false` runs the hub without
+  the web terminal.
+
 ### Trust and identity
 
 Every credential in the system, who holds it, and who checks it.
@@ -658,6 +704,7 @@ flowchart TB
     KP["herdr-keeper<br/>one per client and machine"]
     PX["ate-wss-proxy<br/>ssh ProxyCommand"]
     HCTL["hubctl"]
+    TT["ttyd 127.0.0.1:7681<br/>web terminal"]
   end
 
   subgraph ate["ate-system"]
@@ -678,6 +725,8 @@ flowchart TB
 
   SH -- "kubectl, exec, port-forward" --> KAPI
   KAPI -. "port-forward gRPC" .-> APISVC
+  KAPI -. "port-forward (web)" .-> TT
+  TT -- "herdr per browser tab" --> HC
   REG -. "image pulls" .-> worker
   HC -- "ssh ate-NAME (wrapper)" --> KP
   KP -- "ssh" --> PX
@@ -693,8 +742,11 @@ flowchart TB
   EGW -- "real key injected" --> ANT
 ```
 
-- In the quick start, nothing listens on your machine except the kind registry (`localhost:5001`) and
-  kube-apiserver's mapped port. In production, nothing listens on it at all.
+- In the quick start, nothing listens on your machine except the kind registry (`localhost:5001`),
+  kube-apiserver's mapped port and, while `web` runs, its port-forward on `127.0.0.1:7681`. In production,
+  only that port-forward.
+- In the hub, ttyd listens on the pod's loopback, so only `kubectl port-forward` reaches it. The production
+  guides' shared link moves it to the pod IP, behind a NetworkPolicy and a sign-in proxy.
 - Inside an actor only websocat listens on all interfaces (port 80, the one port the router forwards). sshd is on
   loopback; herdr and herdr-anchor use Unix sockets.
 - Actor egress is HTTPS only, through the gateway. The DNS relay answers NXDOMAIN for hosts outside the egress
@@ -722,6 +774,7 @@ only apply to the kind registry.
 | `delete <name>` | removes one actor: its herdr machine (first, so nothing reconnects and resumes it), its egress policy, the actor and its snapshot |
 | `verify <name>` | calls the Anthropic API from inside the actor with the placeholder key |
 | `attach` | herdr TUI in the hub, sized to your terminal |
+| `web` | the same TUI in your browser: port-forward to the hub's ttyd, opens `http://localhost:7681/` (`WEB_PORT`) |
 | `suspend <name>` / `resume <name>` | `hubctl` in the hub (see [Lifecycle](#lifecycle)); resuming by hand is optional, input wakes actors |
 | `status` | actors and herdr machines, as the hub sees them |
 | `logs` | follows the hub: idle-bridge decisions |
@@ -787,7 +840,7 @@ flowchart LR
     c3["hub<br/>deploy: WorkerPool, Secret, policy"]
     c4["deploy: atespace, template<br/>actor, delete, down"]
     c5["machine, suspend, resume<br/>status, verify, debug"]
-    c6["attach"]
+    c6["attach, web"]
     c7["logs"]
   end
   docker["docker, buildx"]
@@ -808,7 +861,7 @@ flowchart LR
   c5 -->|"kubectl exec"| hubctl
   hubctl --> api
   hubctl --> actor
-  c6 -->|"kubectl exec -it"| herdr --> actor
+  c6 -->|"kubectl exec -it,<br/>port-forward to ttyd"| herdr --> actor
   c7 -->|"kubectl logs"| kapi
 ```
 
@@ -949,6 +1002,27 @@ sequenceDiagram
 
 herdr connects only while a client is attached. While it is, idle actors are still suspended, and their machines
 still show online ([Always-on machines](#always-on-machines)).
+
+#### `web`
+
+The same as `attach`, in a browser tab. See [herdr in the browser](#herdr-in-the-browser).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U as You
+  participant S as herdr-substrate.sh
+  participant K as kube-apiserver
+  participant T as ttyd in the hub
+  participant H as herdr client
+  U->>S: web
+  S->>K: kubectl port-forward 127.0.0.1:7681 to the hub pod's 7681
+  S->>U: opens http://localhost:7681/
+  U->>T: page, then a WebSocket, through the port-forward
+  T->>H: starts herdr on a terminal the size of the tab
+  H-->>U: the TUI, drawn by xterm.js, and keys go back the same way
+  U->>T: closing the tab ends that client, the actors keep running
+```
 
 #### `verify <name>`
 
@@ -1103,6 +1177,8 @@ Desktop, `BUILDX_BUILDER` (step 4); everything else has a working default.
 | `IDLE_SECONDS` | `300` | idle time before the hub suspends an actor (applied by `hub`) |
 | `POLL_SECONDS` | `30` | idle-bridge poll interval (applied by `hub`) |
 | `ATE_INGRESS_ALLOWED_SPIFFE_IDS` | — | extra router clients; the hub's ID is always added |
+| `WEB_PORT` | `7681` | local port `web` forwards from |
+| `WEB_OPEN` | `true` | `web` opens your browser; `false` only prints the URL |
 
 The production guides add these. Their defaults are the quick start's.
 
@@ -1119,6 +1195,8 @@ The production guides add these. Their defaults are the quick start's.
 | `ATE_CLIENT_SERVICE_ACCOUNT` | — (substrate: `ate-client`) | read by kubectl-ate: the ServiceAccount in `ate-system` it acts as |
 | `ACTOR_IMAGE` | — (what `image` built) | prebuilt actor image, by tag or digest ([Prebuilt images](#prebuilt-images-from-github)) |
 | `HUB_IMAGE` | — (what `hub-image` built) | prebuilt hub image; its substrate release must match the cluster's |
+| `HUB_WEB_ADDR` | `127.0.0.1` | where the hub's ttyd listens (applied by `hub`); `0.0.0.0` for a sign-in proxy in front, as in each guide's step 14 |
+| `HUB_WEB_AUTH_HEADER` | — | ttyd refuses requests without this header (applied by `hub`); the guides' oauth2-proxy sets `X-Forwarded-Email` |
 
 ## Disk and resources (quick start)
 
@@ -1139,7 +1217,7 @@ fails in ways that look unrelated.
 | Path | Purpose |
 |---|---|
 | `actor/Dockerfile`, `actor/entrypoint.sh`, `actor/sshd_config`, `actor/herdr-config.toml` | the agent actor: Claude Code and a herdr server behind sshd behind websocat :80; pinned binaries; Claude onboarding pre-completed |
-| `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge; takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
+| `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge and the web terminal (ttyd); takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
 | `hub/ate-wss-proxy` | SSH ProxyCommand: mTLS WebSocket to atenet-router with the pod's SPIFFE certificate |
 | `hub/hubctl` | add/remove machines, suspend/resume (parking keepers), idle bridge, `ate` passthrough |
 | `hub/herdr-keeper`, `hub/ssh` | keeps each machine connection looking online while its actor is suspended; the `ssh` wrapper hands herdr's bridges to it |
@@ -1153,7 +1231,7 @@ fails in ways that look unrelated.
 | `host/herdr-substrate.sh` | every command above |
 | `docs/production-gke.md`, `docs/production-kubernetes.md` | production deployments on GKE and on upstream Kubernetes |
 | `.github/workflows/images.yml` | builds and publishes `herdr-actor` and `herdr-hub` (per substrate release) to GHCR, multi-arch, with provenance |
-| `test/` | `keeper-test.py`, `local-bridge-test.sh`, `hub-path-test.sh`, `fake_router.py`, `ssh_config.tmpl`, `Dockerfile.local` |
+| `test/` | `keeper-test.py`, `local-bridge-test.sh`, `hub-path-test.sh`, `web-client.js` (drives the web terminal in Chromium), `fake_router.py`, `ssh_config.tmpl`, `Dockerfile.local` |
 | `.state/` | created by the script: image digests, the hub's public key, rendered manifests. Per checkout; safe to delete |
 
 ## Verification status
@@ -1184,6 +1262,8 @@ fails in ways that look unrelated.
 | Suspended: luna shows online for 45 s of health checks; nothing reaches the router; a resize doesn't wake it | same | pass |
 | A typed command wakes it: router resumes the actor, keeper rejoins the same session, output on screen | same | container up in 0.16 s, session resumed in 0.38 s |
 | Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor | `test/keeper-test.py` | 23/23 |
+| Web terminal: ttyd in the hub listens on loopback only; headless Chromium types a command that runs on luna and shows in the tmux client too; closing the tab ends its herdr client; a new tab on a suspended luna wakes it | `test/hub-path-test.sh` steps 1, 10, 11 (30/30 in all) | pass |
+| `web`: forwards, checks the page answers, stops the port-forward on exit; reports a proxy-only hub (407) clearly | script run against a stub kubectl and ttyd | pass |
 | Scripts | `shellcheck` | clean |
 
 **Production guides** (build environment, 2026-10-25). They have not yet run against a real GKE or upstream
@@ -1219,7 +1299,9 @@ test/keeper-test.py
 The other two run against plain Docker, without a cluster. They need herdr 0.9.5, websocat 1.14 or newer,
 OpenSSH, openssl and tmux on your machine (`brew install herdr websocat tmux`), and use a throwaway `HOME`: your
 own herdr machines and `~/.ssh` are untouched. The hub test drives a real herdr TUI in tmux, and emulates
-substrate's suspend with `docker pause`.
+substrate's suspend with `docker pause`. Its last steps use the hub's web terminal from a headless Chromium, so it
+also needs ttyd and Node.js with Playwright (`brew install ttyd`, then `npm install -g playwright` and
+`npx playwright install chromium`; with a global install, set `NODE_PATH="$(npm root -g)"`).
 
 ```bash
 docker buildx build --load -t herdr-actor:dev actor/
@@ -1288,7 +1370,11 @@ test/hub-path-test.sh herdr-actor:dev
 - The hub's SSH private key is generated on its volume and never leaves the cluster.
 - Router access is limited to the hub's SPIFFE identity; ate-api access to atespace editor on one atespace.
 - No agent or port forwarding in either direction (`ForwardAgent no`; the actor's sshd refuses all forwarding).
-- Anyone who can `kubectl exec` into the hub controls every actor: treat the `herdr-hub` namespace as sensitive.
+- Anyone who can `kubectl exec` into the hub, or port-forward to it, controls every actor: treat the `herdr-hub`
+  namespace as sensitive.
+- The hub's web terminal (ttyd) listens on the pod's loopback, so only a port-forward reaches it, and it refuses
+  WebSockets from other origins. A shared link is only ever behind sign-in (each guide's step 14), and anyone who
+  gets through that sign-in controls every actor.
 - Treat each actor's herdr server as untrusted; it is a remote herdr your client renders.
 - `herdr-anchor`'s socket in the actor is root-only, and reaching it already takes the hub's SSH key; the keeper
   adds no credential of its own. Keeper control sockets live in the hub's `/tmp/herdr-keepers`, root-only.
@@ -1351,6 +1437,9 @@ the hub.
 | `logs`: `not suspending, keeper reported: busy` | someone typed while the keepers were parking; the next poll tries again |
 | `logs`: `not suspending, keeper reported: unsupported` | the actor's image has no `herdr-anchor` (built before it existed): it works, but can't be suspended under an attached client. Rebuild with `image`, then `down` and `deploy` to recreate the template |
 | A machine shows `reconnecting` after a long suspend | the resume took longer than `HERDR_KEEPER_WAKE_TIMEOUT` (180 s), or the actor lost its session (reverted, crashed, or the anchor's 15-minute cleanup ran). herdr reconnects by itself; the keeper log in the hub (`/tmp/herdr-keepers/<name>/`) says which |
+| `web`: "this hub image has no web terminal" | the hub runs an image from before ttyd was added: `hub-image` (or a newer `HUB_IMAGE`), then `hub` |
+| `web`: "port-forward failed" | something else uses local port 7681: `WEB_PORT=7682 host/herdr-substrate.sh web` |
+| The web page says "Press ⏎ to Reconnect" | the WebSocket dropped (laptop asleep, `web` stopped, proxy timeout). Restart `web` if needed and press Enter: a fresh herdr client starts, nothing on the hub or the actors is lost |
 | zsh: a pasted command waits at `quote>` | it contained a `#` comment with an apostrophe; press Ctrl-C. `setopt interactive_comments` in `~/.zshrc` makes zsh accept comments |
 
 ## Changelog
@@ -1380,3 +1469,7 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   - **Idle detection:** idle means no working or blocked agent *and* no input, and only running actors are polled.
   - **Older images:** actors without the anchor fall back to a plain relay and aren't suspended under an
     attached client.
+- **herdr in the browser:** the hub runs ttyd on its loopback, and the new `web` command port-forwards to it and
+  opens the page. Each guide's step 14 adds a shared link behind sign-in: IAP on GKE, oauth2-proxy elsewhere.
+- **Container `/tmp`:** the actor entrypoint sets `/tmp` and `/var/tmp` to mode 1777, which Claude Code needs
+  for its cross-session messaging socket.

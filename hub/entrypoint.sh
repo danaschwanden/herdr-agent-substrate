@@ -2,9 +2,11 @@
 # Hub pod entrypoint. HOME is the persistent volume, so herdr's saved
 # machines, the SSH key, known_hosts and idle timers survive restarts.
 #
-# Then: run the idle bridge (hubctl idle-watch) as a supervised service.
-# The herdr TUI is not started here: attach with
-#   kubectl -n herdr-hub exec -it deploy/herdr-hub -- herdr
+# Then: run two supervised services, the idle bridge (hubctl idle-watch) and
+# the web terminal (ttyd). The herdr TUI itself is not started here; each
+# client starts its own:
+#   attach   kubectl -n herdr-hub exec -it deploy/herdr-hub -- herdr
+#   web      a browser tab on ttyd, which runs herdr per tab
 # Herdr opens machine connections only while a TUI client is attached, so an
 # unattended hub never keeps actors awake.
 set -euo pipefail
@@ -62,6 +64,36 @@ if [[ "${IDLE_WATCH:-true}" == "true" ]]; then
   supervise idle-watch hubctl idle-watch &
 else
   log "idle bridge disabled (IDLE_WATCH=${IDLE_WATCH})"
+fi
+
+# --- herdr in the browser -----------------------------------------------------
+# ttyd serves the herdr TUI as a web page; every browser tab is its own herdr
+# client, exactly like every `attach`. It listens on loopback by default,
+# reachable only through `kubectl port-forward` (the `web` command), so the
+# same Kubernetes permissions guard it as guard `attach`. The production
+# guides listen on the pod IP behind IAP or oauth2-proxy instead.
+#   HUB_WEB              true | false (default true)
+#   HUB_WEB_ADDR         listen address (default 127.0.0.1; 0.0.0.0 = all)
+#   HUB_WEB_PORT         default 7681
+#   HUB_WEB_AUTH_HEADER  optional; refuse requests without this header, which
+#                        an authenticating proxy sets (e.g. X-Forwarded-Email)
+HUB_WEB="${HUB_WEB:-true}"
+HUB_WEB_ADDR="${HUB_WEB_ADDR:-127.0.0.1}"
+HUB_WEB_PORT="${HUB_WEB_PORT:-7681}"
+if [[ "${HUB_WEB}" != "true" ]]; then
+  log "web terminal disabled (HUB_WEB=${HUB_WEB})"
+elif ! command -v ttyd >/dev/null; then
+  log "WARNING: ttyd is not in this image; the web terminal is unavailable"
+else
+  # -W: tabs may type (ttyd is read-only otherwise); -O: refuse WebSockets
+  # from other origins; the page title stays "herdr"; closing a tab only
+  # detaches that client, so no "leave this page?" prompt.
+  web_args=(-p "${HUB_WEB_PORT}" -W -O -w "${HOME}"
+            -t titleFixed=herdr -t disableLeaveAlert=true)
+  [[ "${HUB_WEB_ADDR}" == "0.0.0.0" ]] || web_args+=(-i "${HUB_WEB_ADDR}")
+  [[ -z "${HUB_WEB_AUTH_HEADER:-}" ]] || web_args+=(-H "${HUB_WEB_AUTH_HEADER}")
+  supervise web ttyd "${web_args[@]}" herdr &
+  log "web terminal on ${HUB_WEB_ADDR}:${HUB_WEB_PORT}"
 fi
 
 log "ready (atespace ${ATESPACE}); attach with: herdr"

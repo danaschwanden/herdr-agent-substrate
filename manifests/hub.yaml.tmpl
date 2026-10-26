@@ -4,6 +4,7 @@
 #
 # Placeholders (rendered by host/herdr-substrate.sh hub):
 #   ${HUB_NAMESPACE}  ${HUB_IMAGE}  ${ATESPACE}  ${IDLE_SECONDS}  ${POLL_SECONDS}
+#   ${HUB_WEB_ADDR}  ${HUB_WEB_AUTH_HEADER}
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -102,6 +103,15 @@ spec:
           value: "${IDLE_SECONDS}"
         - name: POLL_SECONDS
           value: "${POLL_SECONDS}"
+        # Web terminal (ttyd). 127.0.0.1: only `kubectl port-forward` reaches
+        # it. The production guides set 0.0.0.0 behind IAP or oauth2-proxy.
+        - name: HUB_WEB_ADDR
+          value: "${HUB_WEB_ADDR}"
+        - name: HUB_WEB_AUTH_HEADER
+          value: "${HUB_WEB_AUTH_HEADER}"
+        ports:
+        - name: web
+          containerPort: 7681
         resources:
           requests:
             cpu: 100m

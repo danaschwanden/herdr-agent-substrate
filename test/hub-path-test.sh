@@ -13,11 +13,13 @@
 #
 # The second half attaches a real herdr TUI (in tmux) and checks the always-on
 # behaviour: the machine stays enabled and shows online while its actor is
-# suspended, and input wakes it.
+# suspended, and input wakes it. Last, a headless Chromium uses the hub's web
+# terminal (ttyd) as a second client.
 #
-# Needs: docker, herdr, websocat, ssh, openssl, tmux, python3 with
-# `websockets`, and atenet-router.ate-system.svc resolving to 127.0.0.1 (add
-# it to /etc/hosts). Usage: test/hub-path-test.sh [ACTOR_IMAGE]
+# Needs: docker, herdr, websocat, ttyd, ssh, openssl, tmux, python3 with
+# `websockets`, node with `playwright` (and its Chromium), and
+# atenet-router.ate-system.svc resolving to 127.0.0.1 (add it to /etc/hosts).
+# Usage: test/hub-path-test.sh [ACTOR_IMAGE]
 # shellcheck disable=SC2015 # "check && ok || bad" is safe: ok and bad always succeed
 set -euo pipefail
 
@@ -49,10 +51,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for c in docker herdr websocat ssh openssl python3 setsid tmux; do
+for c in docker herdr websocat ttyd ssh openssl python3 setsid tmux node; do
   command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
 done
 python3 -c 'import websockets' 2>/dev/null || { echo "pip install websockets" >&2; exit 1; }
+node -e "require('playwright')" 2>/dev/null || { echo "npm install playwright, then npx playwright install chromium" >&2; exit 1; }
 getent hosts "${ROUTER_HOST}" | grep -q '127.0.0.1' \
   || { echo "add '127.0.0.1 ${ROUTER_HOST}' to /etc/hosts" >&2; exit 1; }
 
@@ -107,7 +110,7 @@ export HOME="${WORK}/hub-home"; mkdir -p "${HOME}"
 export ATE_IDENTITY_BUNDLE="${pki}/hub.bundle.pem" ATE_ROUTER_CA="${pki}/servicedns.crt" \
        ATE_API_TOKEN="${WORK}/token" ATE_ROUTER_URL="wss://${ROUTER_HOST}:${ROUTER_PORT}/" \
        HUB_SHARE="${KIT_DIR}/hub" IDLE_SECONDS=15 POLL_SECONDS=3 \
-       HERDR_KEEPER_RUN="${WORK}/keepers"
+       HERDR_KEEPER_RUN="${WORK}/keepers" HUB_WEB_PORT="${WEB_PORT:-7699}"
 
 step "1. hub starts and generates its SSH key"
 setsid bash "${KIT_DIR}/hub/entrypoint.sh" >"${WORK}/hub.log" 2>&1 &
@@ -115,6 +118,15 @@ hub_pid=$!
 for _ in $(seq 1 20); do [[ -s "${HOME}/.ssh/id_ed25519.pub" ]] && break; sleep 0.5; done
 if [[ -s "${HOME}/.ssh/id_ed25519.pub" ]]; then ok "hub key $(cut -c1-30 "${HOME}/.ssh/id_ed25519.pub")..."; else bad "no hub key"; fi
 grep -q "ProxyCommand ate-wss-proxy" "${HOME}/.ssh/config" && ok "hub ssh config rendered" || bad "hub ssh config"
+# Listening sockets as hex address:port; the web terminal must be loopback-only.
+listeners() { awk 'NR > 1 && $4 == "0A" { print $2 }' /proc/net/tcp; }
+web_hex="$(printf '%04X' "${HUB_WEB_PORT}")"
+for _ in $(seq 1 20); do listeners | grep -q ":${web_hex}$" && break; sleep 0.5; done
+if [[ "$(listeners | grep ":${web_hex}$")" == "0100007F:${web_hex}" ]]; then
+  ok "web terminal listens on 127.0.0.1:${HUB_WEB_PORT} only"
+else
+  bad "web terminal listeners: $(listeners | grep ":${web_hex}$" | tr '\n' ' ')"
+fi
 
 step "2. actor trusts the hub key; router stand-in enforces mTLS + routing"
 docker run -d --name "${NAME}" -p "127.0.0.1:${ACTOR_PORT}:80" \
@@ -229,6 +241,42 @@ started="$(docker logs "${NAME}" 2>&1 | grep -c 'bridge started' || true)"
 [[ "$(luna_row)" == *●* ]] && ok "luna online throughout" || bad "luna row: '$(luna_row)'"
 hubctl status 2>/dev/null | grep -q 'keeper luna (pid [0-9]*): awake' \
   && ok "hubctl status shows the keeper awake" || bad "hubctl status: $(hubctl status 2>&1 | tail -n 2)"
+
+step "10. a browser is a second client, through the hub's web terminal"
+web_run() { # name, then the steps as JSON
+  printf '%s' "$2" >"${WORK}/$1.json"
+  WEB_SCREENSHOT="${WORK}/$1.png" node "${KIT_DIR}/test/web-client.js" \
+    "http://127.0.0.1:${HUB_WEB_PORT}/" "${WORK}/$1.json" >"${WORK}/$1.log" 2>&1
+}
+# shellcheck disable=SC2016 # expanded by the shell on luna
+# Wait for luna's pane itself (step 9's output), not just the sidebar: until
+# the new client's connection to luna is up, keys have no pane to go to.
+if web_run web-type '[{"wait": "always-on-42", "timeout": 60},
+    {"type": "echo browser-$((6*7))"}, {"keys": ["Enter"]}, {"wait": "browser-42", "timeout": 30}]'; then
+  ok "typed in the browser; the command ran on luna"
+else
+  bad "browser: $(tail -n 30 "${WORK}/web-type.log")"
+fi
+tui capture-pane -p -t tui | grep -q 'browser-42' \
+  && ok "the tmux client sees the same pane: one server, two clients" || bad "tmux client did not see the browser's command"
+sleep 2
+ttyd_pid="$(pgrep -x ttyd | head -n 1)"
+[[ -n "${ttyd_pid}" && -z "$(pgrep -P "${ttyd_pid}" || true)" ]] \
+  && ok "closing the tab ended its herdr client; the hub keeps running" || bad "herdr client left behind under ttyd"
+
+step "11. the next morning: open the page while luna is suspended"
+start=$SECONDS
+until [[ "$(paused)" == true ]] || (( SECONDS - start > 90 )); do sleep 2; done
+[[ "$(paused)" == true ]] && ok "luna suspended again after $((SECONDS - start))s" || bad "luna never suspended"
+# shellcheck disable=SC2016 # expanded by the shell on luna
+if web_run web-wake '[{"wait": "browser-42", "timeout": 60},
+    {"type": "echo morning-$((6*7))"}, {"keys": ["Enter"]}, {"wait": "morning-42", "timeout": 60}]'; then
+  ok "a new tab on a suspended luna works: luna woke and ran the command"
+else
+  bad "browser: $(tail -n 30 "${WORK}/web-wake.log")"
+fi
+[[ "$(grep -c "RESUME ${ATESPACE}/luna" "${WORK}/router.log")" -ge 2 ]] \
+  && ok "the router resumed luna for the browser" || bad "no second RESUME"
 
 echo; echo "lifecycle calls made by the hub (polls omitted):"; grep -v "get actors" "${STUB_LOG}" | sed 's/^/  /' || true
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"

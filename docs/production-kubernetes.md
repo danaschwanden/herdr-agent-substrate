@@ -36,6 +36,7 @@ Everything else matches [production-gke.md](production-gke.md). Read that guide'
 - [11. Harden the hub and the credential provider](#11-harden-the-hub-and-the-credential-provider)
 - [12. Agents](#12-agents)
 - [13. Operators](#13-operators)
+- [14. Browser access](#14-browser-access)
 - [Operations](#operations)
 - [Troubleshooting](#troubleshooting)
 - [Production checklist](#production-checklist)
@@ -84,7 +85,7 @@ flowchart LR
     SEC[("Secret anthropic<br/>herdr-agents-secrets")]
   end
 
-  OP -- "kubectl exec" --> HUB
+  OP -- "kubectl exec, port-forward<br/>(optional: browser via sign-in proxy)" --> HUB
   OP -- "kubectl-ate, as herdr-operator" --> API
   HUB -- "mTLS WebSocket, SSH inside" --> RT --> W
   HUB -- "gRPC, atespace editor" --> API
@@ -769,7 +770,7 @@ host/herdr-substrate.sh attach
 
 Operators need the same rights as on GKE ([GKE step 13](production-gke.md#13-operators)):
 
-- exec into the hub;
+- exec into the hub, and port-forward to it for `web`;
 - mint tokens for `herdr-operator` and nothing else;
 - port-forward to ate-api;
 - read ClusterTrustBundles.
@@ -823,7 +824,7 @@ rules:
   resources: ["pods"]
   verbs: ["get", "list"]
 - apiGroups: [""]
-  resources: ["pods/exec"]
+  resources: ["pods/exec", "pods/portforward"]
   verbs: ["create"]
 - apiGroups: [""]
   resources: ["pods/log"]
@@ -869,11 +870,312 @@ subjects:
   name: ${OPERATOR_USER}
 EOF
 kubectl --context "$KUBE_CONTEXT" auth can-i create pods/exec -n herdr-hub --as "$OPERATOR_USER"
+kubectl --context "$KUBE_CONTEXT" auth can-i create pods/portforward -n herdr-hub --as "$OPERATOR_USER"
 kubectl --context "$KUBE_CONTEXT" auth can-i create serviceaccounts/herdr-operator --subresource=token -n ate-system --as "$OPERATOR_USER"
 kubectl --context "$KUBE_CONTEXT" auth can-i create serviceaccounts/substrate-admin --subresource=token -n ate-system --as "$OPERATOR_USER"
 ```
 
-The first two checks must print `yes`, the third `no`. `hub`, `deploy` and `down` stay with cluster admins.
+The first three checks must print `yes`, the fourth `no`. `hub`, `deploy` and `down` stay with cluster admins.
+
+## 14. Browser access
+
+Every operator from step 13 can already use herdr in a browser, with nothing more to set up:
+
+```bash
+cd "$KIT_DIR"
+host/herdr-substrate.sh web
+```
+
+`web` port-forwards to the hub's web terminal, which listens only on the pod's loopback, and opens
+<http://localhost:7681/>. The port-forward doesn't use the pod network, so step 11's policy doesn't get in the
+way. This is the recommended setup: no new listener, and access is exactly the step 13 RBAC.
+
+The rest of this step is optional. It gives operators a **shared link**, such as `https://herdr.example.com`,
+behind your identity provider's sign-in. [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/) does the
+OpenID Connect sign-in in its own namespace, and is the only thing that may reach the hub's web terminal:
+
+```mermaid
+flowchart LR
+  OP(["operator's browser"]) -->|"HTTPS"| GW["your Gateway<br/>TLS for WEB_HOST"]
+  GW -->|"HTTPRoute"| OP2["oauth2-proxy<br/>herdr-web namespace, :4180"]
+  OP2 -. "sign-in" .-> IDP(["your OIDC provider"])
+  OP2 -->|"signed-in requests,<br/>X-Forwarded-Email"| T["ttyd, hub pod :7681"]
+  T --> H["herdr client per tab"]
+```
+
+Anyone the proxy lets through controls every actor, so allow exactly the people who may `attach`.
+
+You need:
+
+- **A Gateway API implementation** (Envoy Gateway, Cilium, Istio, NGINX Gateway Fabric, …) with a Gateway that
+  has an HTTPS listener for the link's DNS name and admits routes from the `herdr-web` namespace. Most proxy
+  WebSockets without extra settings; if yours puts a request timeout on routes, lift it for this one.
+- **An OpenID Connect client** at your identity provider, with redirect URL `https://<name>/oauth2/callback`.
+
+**Settings.** Add these to the settings file and fill them in. `GATEWAY_PODS_NAMESPACE` is where the Gateway's
+data-plane pods run, which the proxy's NetworkPolicy admits:
+
+```bash
+cat >> ~/herdr-prod/k8s.env <<'EOF'
+export WEB_HOST=herdr.example.com
+export GATEWAY_NAME=public
+export GATEWAY_NAMESPACE=gateway
+export GATEWAY_PODS_NAMESPACE=envoy-gateway-system
+export OIDC_ISSUER=https://idp.example.com
+export OIDC_CLIENT_ID=herdr-web
+export OAUTH2_PROXY_IMAGE=quay.io/oauth2-proxy/oauth2-proxy:v7.15.5
+EOF
+${EDITOR:-vi} ~/herdr-prod/k8s.env
+source ~/herdr-prod/k8s.env
+```
+
+Copy `OAUTH2_PROXY_IMAGE` into your registry and pin it by digest, as in step 6, for anything beyond a trial.
+
+**The hub listens on its pod IP** and refuses any request without the header oauth2-proxy sets for signed-in
+users. A Service gives the proxy a stable name, and a second NetworkPolicy, beside step 11's, admits only the
+proxy's pods:
+
+```bash
+cd "$KIT_DIR"
+printf 'HUB_WEB_ADDR=0.0.0.0\nHUB_WEB_AUTH_HEADER=X-Forwarded-Email\n' >> .env
+host/herdr-substrate.sh hub
+cat <<'EOF' | kubectl --context "$KUBE_CONTEXT" apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: herdr-hub-web
+  namespace: herdr-hub
+spec:
+  selector:
+    app: herdr-hub
+  ports:
+  - name: web
+    port: 7681
+    targetPort: web
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: herdr-hub-web
+  namespace: herdr-hub
+spec:
+  podSelector:
+    matchLabels:
+      app: herdr-hub
+  policyTypes: ["Ingress"]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: herdr-web
+      podSelector:
+        matchLabels:
+          app: herdr-web-auth
+    ports:
+    - protocol: TCP
+      port: 7681
+EOF
+```
+
+**oauth2-proxy.** Its namespace runs under Pod Security `restricted`. The client secret and a fresh cookie secret
+go into a Secret without touching disk, and the allowed operators into a list:
+
+```bash
+kubectl --context "$KUBE_CONTEXT" create namespace herdr-web
+kubectl --context "$KUBE_CONTEXT" label namespace herdr-web pod-security.kubernetes.io/enforce=restricted
+printf 'OIDC client secret: '; read -rs OIDC_CLIENT_SECRET; printf '\n'
+kubectl --context "$KUBE_CONTEXT" -n herdr-web create secret generic herdr-web-auth --from-literal=client-secret="$OIDC_CLIENT_SECRET" --from-literal=cookie-secret="$(openssl rand -base64 32 | tr -- '+/' '-_')"
+unset OIDC_CLIENT_SECRET
+printf '%s\n' "$OPERATOR_USER" > "$OPS_DIR/herdr-web-emails.txt"
+${EDITOR:-vi} "$OPS_DIR/herdr-web-emails.txt"
+kubectl --context "$KUBE_CONTEXT" -n herdr-web create configmap herdr-web-emails --from-file=emails.txt="$OPS_DIR/herdr-web-emails.txt"
+```
+
+The list holds email addresses as your identity provider reports them, one per line; `OPERATOR_USER` is a
+starting point if it's an email address. Then the proxy, its Service, its route, and its NetworkPolicy:
+
+```bash
+cat <<EOF | kubectl --context "$KUBE_CONTEXT" apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: herdr-web-auth
+  namespace: herdr-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: herdr-web-auth
+  template:
+    metadata:
+      labels:
+        app: herdr-web-auth
+    spec:
+      securityContext:
+        # The image's nonroot user, by number, so the kubelet can verify it.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: oauth2-proxy
+        image: ${OAUTH2_PROXY_IMAGE}
+        args:
+        - --http-address=0.0.0.0:4180
+        - --upstream=http://herdr-hub-web.herdr-hub.svc.cluster.local:7681/
+        - --provider=oidc
+        - --oidc-issuer-url=${OIDC_ISSUER}
+        - --client-id=${OIDC_CLIENT_ID}
+        - --redirect-url=https://${WEB_HOST}/oauth2/callback
+        - --authenticated-emails-file=/etc/herdr-web/emails.txt
+        - --reverse-proxy=true
+        - --cookie-secure=true
+        - --cookie-expire=12h
+        - --skip-provider-button=true
+        - --pass-user-headers=true
+        env:
+        - name: OAUTH2_PROXY_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: herdr-web-auth
+              key: client-secret
+        - name: OAUTH2_PROXY_COOKIE_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: herdr-web-auth
+              key: cookie-secret
+        ports:
+        - name: http
+          containerPort: 4180
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: http
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: emails
+          mountPath: /etc/herdr-web
+          readOnly: true
+      volumes:
+      - name: emails
+        configMap:
+          name: herdr-web-emails
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: herdr-web-auth
+  namespace: herdr-web
+spec:
+  selector:
+    app: herdr-web-auth
+  ports:
+  - name: http
+    port: 4180
+    targetPort: http
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: herdr-web
+  namespace: herdr-web
+spec:
+  parentRefs:
+  - name: ${GATEWAY_NAME}
+    namespace: ${GATEWAY_NAMESPACE}
+  hostnames:
+  - ${WEB_HOST}
+  rules:
+  - backendRefs:
+    - name: herdr-web-auth
+      port: 4180
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: herdr-web-auth
+  namespace: herdr-web
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ${GATEWAY_PODS_NAMESPACE}
+    ports:
+    - protocol: TCP
+      port: 4180
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: herdr-hub
+      podSelector:
+        matchLabels:
+          app: herdr-hub
+    ports:
+    - protocol: TCP
+      port: 7681
+  # The identity provider, for discovery, token exchange and keys.
+  - ports:
+    - protocol: TCP
+      port: 443
+EOF
+kubectl --context "$KUBE_CONTEXT" -n herdr-web rollout status deployment/herdr-web-auth
+kubectl --context "$KUBE_CONTEXT" -n herdr-web get httproute herdr-web -o jsonpath='{range .status.parents[*].conditions[*]}{.type}={.status} {end}{"\n"}'
+```
+
+The route must show `Accepted=True ResolvedRefs=True`. Port 443 egress is open to any address because
+identity providers rarely have fixed ones; narrow it to yours if you can.
+
+**Check it.** Without a session, the link redirects to sign-in. From inside the cluster, the hub refuses
+anything but the proxy, and ttyd refuses requests that lack the proxy's header:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://$WEB_HOST/"
+kubectl --context "$KUBE_CONTEXT" -n default run web-probe --rm -i --restart=Never --image=curlimages/curl:8.17.0 -- curl -sS -m 5 -o /dev/null -w '%{http_code}\n' http://herdr-hub-web.herdr-hub.svc:7681/ || true
+```
+
+The first prints `302` and a sign-in URL. The second must time out (`000`, or the pod's error); an answer means
+NetworkPolicy isn't enforced. Then open `https://$WEB_HOST` and sign in.
+
+**Who may sign in** is the list. To change it, edit the file and replace the ConfigMap; restart the proxy to
+apply it at once:
+
+```bash
+kubectl --context "$KUBE_CONTEXT" -n herdr-web create configmap herdr-web-emails --from-file=emails.txt="$OPS_DIR/herdr-web-emails.txt" --dry-run=client -o yaml | kubectl --context "$KUBE_CONTEXT" apply -f -
+kubectl --context "$KUBE_CONTEXT" -n herdr-web rollout restart deployment/herdr-web-auth
+```
+
+The proxy checks requests, not open tabs. To cut off a tab that is already open, also restart the hub
+(`kubectl -n herdr-hub rollout restart deployment/herdr-hub`), which ends every client.
+
+To take the link down, delete the `herdr-web` namespace, the hub's `herdr-hub-web` Service and policy, remove the
+two `HUB_WEB_` lines from `.env`, and re-run `hub`.
 
 ## Operations
 
@@ -991,6 +1293,10 @@ Start with the [kit's troubleshooting chain](../README.md#troubleshooting). Upst
 | `verify` times out | Control-plane nodes can't reach `api.anthropic.com` (egress firewall or proxy) |
 | Hub can't reach anything after step 11 | Cluster DNS labels differ from `k8s-app=kube-dns`, or the API server's addresses changed; adjust and re-run the block |
 | `kubectl ate`: `unknown service` / `Unimplemented` | kubectl-ate built from another substrate commit; rebuild from `$SUBSTRATE_DIR` (and `hub-image`) |
+| Shared link: `502` or `upstream connect error` after sign-in | The proxy can't reach ttyd: `HUB_WEB_ADDR=0.0.0.0` not applied (re-run `hub`), the `herdr-hub-web` Service or policy is missing, or the proxy's policy lacks the hub. `kubectl -n herdr-web logs deploy/herdr-web-auth` |
+| Shared link: `407 Proxy Authentication Required` | ttyd didn't get `X-Forwarded-Email`: the proxy runs without `--pass-user-headers=true`, or `HUB_WEB_AUTH_HEADER` names another header |
+| Shared link: `403` after sign-in | The address your provider reports isn't in `herdr-web-emails`, exactly as written |
+| Shared link: page loads, then "Press ⏎ to Reconnect" straight away | The WebSocket was refused: the Gateway rewrote the `Host` header (ttyd checks it against the page's origin), or the route doesn't allow upgrades |
 
 ## Production checklist
 
@@ -1002,6 +1308,7 @@ Start with the [kit's troubleshooting chain](../README.md#troubleshooting). Upst
 - [ ] Bucket private, credential limited to it; you've accepted that every agent node can read every snapshot
 - [ ] Bootstrap owner is `substrate-admin`; day-to-day work as `herdr-operator`; `ate-client` holds nothing
 - [ ] Credential provider bound to `herdr-agents-secrets` only, re-applied after each install
-- [ ] Hub: NetworkPolicy, Pod Security `baseline`, exec limited to operators, SSH key in your secret store
+- [ ] Hub: NetworkPolicy, Pod Security `baseline`, exec and port-forward limited to operators, SSH key in your secret store
+- [ ] Browser access by `web` only, or a shared link behind oauth2-proxy with an explicit list of operators
 - [ ] Claude Code and herdr versions pinned in the actor image
 - [ ] OTLP collector receiving; alerts in place

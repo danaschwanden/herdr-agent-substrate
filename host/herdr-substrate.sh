@@ -4,7 +4,8 @@
 #   agents   -> one substrate actor each (gVisor), herdr server inside
 #   hub      -> an ordinary pod: the herdr client for all actors + the
 #               lifecycle controller (idle bridge, suspend/resume)
-#   you      -> kubectl exec into the hub and run herdr there
+#   you      -> kubectl exec into the hub and run herdr there (attach), or
+#               the same through a browser and port-forward (web)
 #
 # Run `host/herdr-substrate.sh help` for the steps. Configuration comes from
 # the environment, or from a .env file next to this kit's README.
@@ -27,6 +28,14 @@ REGISTRY="${REGISTRY:-localhost:5001}"
 HERDR_VERSION="${HERDR_VERSION:-0.9.5}"
 IDLE_SECONDS="${IDLE_SECONDS:-300}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
+# Web terminal in the hub. The default listens on the pod's loopback, reached
+# only through `web` (kubectl port-forward). The production guides set
+# HUB_WEB_ADDR=0.0.0.0 behind IAP or oauth2-proxy, and HUB_WEB_AUTH_HEADER to
+# the header that proxy sets for signed-in users.
+HUB_WEB_ADDR="${HUB_WEB_ADDR:-127.0.0.1}"
+HUB_WEB_AUTH_HEADER="${HUB_WEB_AUTH_HEADER:-}"
+# Local port `web` listens on.
+WEB_PORT="${WEB_PORT:-7681}"
 # Image platform; empty builds for this machine's architecture (right for kind).
 # Set it to the cluster nodes' platform elsewhere, e.g. linux/amd64.
 PLATFORM="${PLATFORM:-}"
@@ -296,7 +305,7 @@ cmd_hub() {
   need kubectl python3
   local hub_image
   hub_image="$(pinned_image herdr-hub "${HUB_IMAGE}" hub-image)"
-  export HUB_NAMESPACE ATESPACE IDLE_SECONDS POLL_SECONDS
+  export HUB_NAMESPACE ATESPACE IDLE_SECONDS POLL_SECONDS HUB_WEB_ADDR HUB_WEB_AUTH_HEADER
   export HUB_IMAGE="${hub_image}"
   log "deploying the hub in namespace ${HUB_NAMESPACE}"
   render "${KIT_DIR}/manifests/hub.yaml.tmpl" | k apply -f -
@@ -483,6 +492,42 @@ cmd_attach() {
     sh -c 'stty rows "$1" cols "$2"; shift 2; exec herdr "$@"' sh "${rows}" "${cols}" "$@"
 }
 
+# web: the herdr TUI in a browser. ttyd in the hub listens on the pod's
+# loopback; this forwards a local port to it, as your kubeconfig identity, so
+# whoever may `attach` may use `web` and nobody else. Every tab is its own herdr
+# client; closing one only detaches it.
+cmd_web() {
+  local url="http://localhost:${WEB_PORT}/"
+  [[ "${WEB_PORT}" =~ ^[0-9]+$ ]] || die "WEB_PORT must be a port number, got ${WEB_PORT}"
+  hub sh -c 'command -v ttyd >/dev/null' \
+    || die "this hub image has no web terminal; rebuild it ('$0 hub-image', or a newer HUB_IMAGE) and run '$0 hub'"
+  # kubectl itself, not the k() wrapper: $! must be kubectl's pid to stop it.
+  kubectl --context "${KUBE_CONTEXT}" -n "${HUB_NAMESPACE}" \
+    port-forward --address 127.0.0.1 deploy/herdr-hub "${WEB_PORT}:7681" >/dev/null &
+  WEB_PF_PID=$!
+  trap 'kill "${WEB_PF_PID}" 2>/dev/null || true' EXIT INT TERM
+  local code=000
+  for _ in $(seq 1 30); do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null || true)"
+    [[ "${code}" != 000 ]] && break
+    kill -0 "${WEB_PF_PID}" 2>/dev/null || die "port-forward failed; is local port ${WEB_PORT} free? (set WEB_PORT)"
+    sleep 0.5
+  done
+  case "${code}" in
+    200) ;;
+    407) die "the hub's web terminal expects the sign-in header ${HUB_WEB_AUTH_HEADER:-of its proxy}; use your proxy's URL, or 'attach'" ;;
+    000) die "the hub's web terminal does not answer; see: kubectl -n ${HUB_NAMESPACE} logs deploy/herdr-hub" ;;
+    *) die "the hub's web terminal answered HTTP ${code}" ;;
+  esac
+  log "herdr in your browser: ${url}  (ctrl+c here stops it; actors keep running)"
+  if [[ "${WEB_OPEN:-true}" == "true" ]]; then
+    if command -v open >/dev/null; then open "${url}"
+    elif command -v xdg-open >/dev/null; then xdg-open "${url}" >/dev/null 2>&1 || true
+    fi
+  fi
+  wait "${WEB_PF_PID}"
+}
+
 # verify NAME: from inside actor NAME, call the Anthropic API with the
 # placeholder key; success means the egress gateway injected the real key.
 cmd_verify() {
@@ -570,8 +615,9 @@ Usage: $0 <command> [args]
   machine <name>    save actor <name> as a herdr machine in the hub
   delete <name>     remove actor <name>: herdr machine, egress policy, actor
   attach            herdr TUI inside the hub
-  suspend <name>    via the hub: disable machine, cut tunnel, suspend actor
-  resume <name>     via the hub: resume actor, enable machine
+  web               the same TUI in your browser, at http://localhost:${WEB_PORT}/
+  suspend <name>    via the hub: park the client sessions, cut tunnel, suspend actor
+  resume <name>     via the hub: resume actor, wake the client sessions
   status            actors and herdr machines, as the hub sees them
   logs              follow the hub (idle bridge decisions)
   verify <name>     check that actor <name> reaches the Anthropic API with the injected key
@@ -594,6 +640,7 @@ main() {
     machine) cmd_machine "$@" ;;
     delete) cmd_delete "$@" ;;
     attach) cmd_attach "$@" ;;
+    web) cmd_web ;;
     suspend|resume) [[ -n "${1:-}" ]] || die "usage: $0 ${cmd} <name>"; hub hubctl "${cmd}" "$1" ;;
     status) hub hubctl status ;;
     logs) k -n "${HUB_NAMESPACE}" logs -f deploy/herdr-hub ;;

@@ -34,6 +34,7 @@ GKE is the cluster substrate's installer targets outside kind. For any other Kub
 - [11. Harden the hub](#11-harden-the-hub)
 - [12. Agents](#12-agents)
 - [13. Operators](#13-operators)
+- [14. Browser access](#14-browser-access)
 - [Operations](#operations)
 - [Troubleshooting](#troubleshooting)
 - [Production checklist](#production-checklist)
@@ -51,7 +52,7 @@ GKE is the cluster substrate's installer targets outside kind. For any other Kub
 | Anthropic key | Kubernetes Secret | Secret Manager, read by substrate's Secret Manager credential provider |
 | Who runs `kubectl ate` | `ate-client`, a global owner | `herdr-operator`, owner of one atespace; `substrate-admin` is the only global owner |
 | Images | `localhost:5001`, your machine's architecture | Artifact Registry, `linux/amd64`, digest-pinned, Claude Code version pinned |
-| Hub | as described in the README | plus a default-deny NetworkPolicy, Pod Security `baseline`, operator RBAC, and its SSH key backed up |
+| Hub | as described in the README | plus a default-deny NetworkPolicy, Pod Security `baseline`, operator RBAC, its SSH key backed up, and optionally a browser link behind IAP |
 
 Everything after the substrate install still goes through `host/herdr-substrate.sh`. Settings in the kit's
 `.env` point it at GKE ([Configuration](../README.md#configuration)).
@@ -88,7 +89,7 @@ flowchart LR
 
   ANT["api.anthropic.com"]
 
-  OP -- "kubectl exec" --> HUB
+  OP -- "kubectl exec, port-forward<br/>(optional: browser via sign-in proxy)" --> HUB
   OP -- "kubectl-ate, as herdr-operator" --> API
   HUB -- "mTLS WebSocket, SSH inside" --> RT --> W
   HUB -- "gRPC, atespace editor" --> API
@@ -706,7 +707,8 @@ host/herdr-substrate.sh status
 
 An operator needs to:
 
-- exec into the hub (`attach`, `machine`, `suspend`, `resume`, `status`, `verify`, `debug`, `logs`);
+- exec into the hub (`attach`, `machine`, `suspend`, `resume`, `status`, `verify`, `debug`, `logs`), and
+  port-forward to it (`web`);
 - reach ate-api as `herdr-operator` (`actor`, `delete`).
 
 Grant exactly that. Repeat the `subjects` entry for each operator, or bind a Google group if your cluster uses
@@ -758,7 +760,7 @@ rules:
   resources: ["pods"]
   verbs: ["get", "list"]
 - apiGroups: [""]
-  resources: ["pods/exec"]
+  resources: ["pods/exec", "pods/portforward"]
   verbs: ["create"]
 - apiGroups: [""]
   resources: ["pods/log"]
@@ -810,13 +812,192 @@ of the kit with the same `.env`. Check what an operator can do:
 
 ```bash
 kubectl --context "$KUBE_CONTEXT" auth can-i create pods/exec -n herdr-hub --as "$OPERATOR_EMAIL"
+kubectl --context "$KUBE_CONTEXT" auth can-i create pods/portforward -n herdr-hub --as "$OPERATOR_EMAIL"
 kubectl --context "$KUBE_CONTEXT" auth can-i create serviceaccounts/herdr-operator --subresource=token -n ate-system --as "$OPERATOR_EMAIL"
 kubectl --context "$KUBE_CONTEXT" auth can-i create serviceaccounts/substrate-admin --subresource=token -n ate-system --as "$OPERATOR_EMAIL"
 ```
 
-The first two must print `yes`, the third `no`.
+The first three must print `yes`, the fourth `no`.
 
 `hub`, `deploy` and `down` change cluster-scoped and namespace objects, so they stay with platform admins.
+
+## 14. Browser access
+
+Every operator from step 13 can already use herdr in a browser, with nothing more to set up:
+
+```bash
+cd "$KIT_DIR"
+host/herdr-substrate.sh web
+```
+
+`web` port-forwards to the hub's web terminal, which listens only on the pod's loopback, and opens
+<http://localhost:7681/>. The port-forward doesn't use the pod network, so step 11's policy doesn't get in the
+way. This is the recommended setup: no new listener, and access is exactly the step 13 RBAC.
+
+The rest of this step is optional. It gives operators a **shared link**, such as `https://herdr.example.com`,
+that needs only a browser and their Google account. Identity-Aware Proxy (IAP) signs them in at Google's load
+balancer before any request reaches the hub:
+
+```mermaid
+flowchart LR
+  OP(["operator's browser"]) -->|"HTTPS, Google sign-in"| LB["external Application Load Balancer<br/>IAP, managed certificate"]
+  LB -->|"HTTP + WebSocket, from Google's<br/>front-end ranges only"| T["ttyd, hub pod :7681"]
+  T --> H["herdr client per tab"]
+```
+
+Anyone IAP lets through controls every actor, so grant access as narrowly as `pods/exec` on the hub.
+
+**Name and address.** Pick a DNS name in a zone you control, and reserve a global address for it:
+
+```bash
+echo 'export WEB_HOST=herdr.example.com' >> ~/herdr-prod/gke.env
+${EDITOR:-vi} ~/herdr-prod/gke.env
+source ~/herdr-prod/gke.env
+gcloud services enable iap.googleapis.com --project "$PROJECT_ID"
+gcloud compute addresses create herdr-web --global --project "$PROJECT_ID"
+gcloud compute addresses describe herdr-web --global --project "$PROJECT_ID" --format='value(address)'
+```
+
+Create an `A` record for `$WEB_HOST` pointing at that address. Google issues the certificate only once the name
+resolves to it.
+
+**The hub listens on its pod IP.** IAP can't add a header that ttyd could check without the load balancer's
+health checks failing, so this setup relies on two things instead: IAP in front, and a NetworkPolicy that admits
+only Google's front-end ranges to port 7681. Policies add up, so this one sits beside step 11's:
+
+```bash
+cd "$KIT_DIR"
+echo 'HUB_WEB_ADDR=0.0.0.0' >> .env
+host/herdr-substrate.sh hub
+cat <<'EOF' | kubectl --context "$KUBE_CONTEXT" apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: herdr-hub-web
+  namespace: herdr-hub
+spec:
+  podSelector:
+    matchLabels:
+      app: herdr-hub
+  policyTypes: ["Ingress"]
+  ingress:
+  # Google's front ends and health checkers: the load balancer's only sources.
+  - from:
+    - ipBlock:
+        cidr: 35.191.0.0/16
+    - ipBlock:
+        cidr: 130.211.0.0/22
+    ports:
+    - protocol: TCP
+      port: 7681
+EOF
+```
+
+**The load balancer.** A Service with container-native load balancing, IAP and a long backend timeout in a
+BackendConfig, a Google-managed certificate, and an Ingress that serves HTTPS only:
+
+```bash
+cat <<EOF | kubectl --context "$KUBE_CONTEXT" apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: herdr-web
+  namespace: herdr-hub
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "herdr-web"}'
+spec:
+  type: ClusterIP
+  selector:
+    app: herdr-hub
+  ports:
+  - name: web
+    port: 7681
+    targetPort: web
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: herdr-web
+  namespace: herdr-hub
+spec:
+  iap:
+    enabled: true
+  # For a WebSocket, this is the longest a connection may stay open, busy or
+  # not. A tab is cut after a day and offers to reconnect.
+  timeoutSec: 86400
+  healthCheck:
+    type: HTTP
+    requestPath: /
+    port: 7681
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: herdr-web
+  namespace: herdr-hub
+spec:
+  domains:
+  - ${WEB_HOST}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: herdr-web
+  namespace: herdr-hub
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: herdr-web
+    networking.gke.io/managed-certificates: herdr-web
+    kubernetes.io/ingress.allow-http: "false"
+spec:
+  defaultBackend:
+    service:
+      name: herdr-web
+      port:
+        number: 7681
+EOF
+```
+
+The load balancer takes a few minutes; the certificate can take up to an hour after the DNS record exists.
+Wait for both:
+
+```bash
+kubectl --context "$KUBE_CONTEXT" -n herdr-hub get ingress herdr-web
+kubectl --context "$KUBE_CONTEXT" -n herdr-hub get managedcertificate herdr-web -o jsonpath='{.status.certificateStatus}{"\n"}'
+```
+
+The certificate status must read `Active`.
+
+**Who may sign in.** Grant each operator, or a Google group, the IAP role on this one backend:
+
+```bash
+BACKEND="$(gcloud compute backend-services list --project "$PROJECT_ID" --global --filter='name~herdr-hub-herdr-web' --format='value(name)')"
+echo "$BACKEND"
+gcloud iap web add-iam-policy-binding --project "$PROJECT_ID" --resource-type=backend-services --service="$BACKEND" --member="user:$OPERATOR_EMAIL" --role=roles/iap.httpsResourceAccessor
+```
+
+IAP checks the sign-in when a tab connects and doesn't re-check an open tab, so revoking access takes effect
+at that operator's next connection: at the latest after the BackendConfig's one-day timeout. To cut someone off
+at once, also restart the hub (`kubectl -n herdr-hub rollout restart deployment/herdr-hub`), which ends every
+client.
+
+IAP uses a Google-managed OAuth client, which admits accounts in your Google Cloud organization. For accounts
+outside it, create an OAuth client and add it to the BackendConfig as `iap.oauthclientCredentials.secretName`
+([IAP for GKE](https://cloud.google.com/iap/docs/enabling-kubernetes-howto)).
+
+**Check it.** Without a sign-in, the load balancer redirects to Google; from inside the cluster, the hub refuses
+everything but Google's ranges:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://$WEB_HOST/"
+kubectl --context "$KUBE_CONTEXT" -n default run web-probe --rm -i --restart=Never --image=curlimages/curl:8.17.0 -- curl -sS -m 5 -o /dev/null -w '%{http_code}\n' http://herdr-web.herdr-hub.svc:7681/ || true
+```
+
+The first prints `302` and an `accounts.google.com` URL. The second must time out (`000`, or the pod's error);
+an answer of `200` means NetworkPolicy isn't enforced. Then open `https://$WEB_HOST` and sign in.
+
+To take the link down, delete the Ingress, the Service, the BackendConfig, the certificate, the `herdr-hub-web`
+policy and the address, then remove `HUB_WEB_ADDR` from `.env` and re-run `hub`.
 
 ## Operations
 
@@ -941,6 +1122,9 @@ Start with the [kit's troubleshooting chain](../README.md#troubleshooting). GKE-
 | `verify` times out | No Cloud NAT, so nothing leaves the private nodes |
 | WorkerPool pods `Pending` | `WORKER_NODE_SELECTOR` doesn't match the `agents` pool's labels, or the pool is at its autoscaling maximum |
 | Golden snapshot never finishes; atelet logs image pull `401`/`403` | The node service account lacks `artifactregistry.reader` on the `herdr` repository |
+| Shared link: `502` from the load balancer | Its health check can't reach ttyd: `HUB_WEB_ADDR=0.0.0.0` not applied (re-run `hub`), or the `herdr-hub-web` policy is missing. `kubectl -n herdr-hub describe ingress herdr-web` shows the backend's health |
+| Shared link: page loads, then "Press ⏎ to Reconnect" straight away | The WebSocket was refused: ttyd checks that the page's origin matches the host, so reach it by `$WEB_HOST` exactly |
+| Shared link: `You don't have access` | The account lacks `roles/iap.httpsResourceAccessor` on the backend, or is outside the organization of IAP's Google-managed client |
 | `machine`/`verify` hang after step 11 | The hub's NetworkPolicy blocks DNS or the control plane: check the policy's `ipBlock` against `kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes` |
 | `kubectl ate`: `PermissionDenied … lacks …` | Acting as the wrong identity: `.env` must set `ATE_CLIENT_SERVICE_ACCOUNT=herdr-operator`; step 8's policy must exist |
 | `kubectl ate`: `unknown service` / `Unimplemented` | kubectl-ate built from another substrate commit; rebuild it from `$SUBSTRATE_DIR` (and `hub-image`) |
@@ -956,6 +1140,7 @@ Start with the [kit's troubleshooting chain](../README.md#troubleshooting). GKE-
 - [ ] Snapshot bucket with public access prevention; transfers scoped per actor
 - [ ] Anthropic key only in Secret Manager; provider limited to one secret and one atespace
 - [ ] Bootstrap owner is `substrate-admin`; day-to-day work as `herdr-operator`; `ate-client` holds nothing
-- [ ] Hub: NetworkPolicy, Pod Security `baseline`, exec limited to operators, SSH key backed up
+- [ ] Hub: NetworkPolicy, Pod Security `baseline`, exec and port-forward limited to operators, SSH key backed up
+- [ ] Browser access by `web` only, or a shared link behind IAP with access granted per operator or group
 - [ ] Claude Code and herdr versions pinned in the actor image
 - [ ] Dashboards and alerts in place; maintenance window set

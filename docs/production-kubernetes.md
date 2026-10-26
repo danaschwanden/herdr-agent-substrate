@@ -643,6 +643,7 @@ WORKER_IMAGE=${SUBSTRATE_REPO}/ateworker-gvisor@${WORKER_DIGEST}
 WORKER_NODE_SELECTOR='{"ate.dev/sandboxClass": "gvisor"}'
 WORKER_REPLICAS=3
 IDLE_SECONDS=900
+CLAUDE_AUTH=${CLAUDE_AUTH:-api-key}
 ATE_CLIENT_SERVICE_ACCOUNT=herdr-operator
 EOF
 cat "$KIT_DIR/.env"
@@ -754,6 +755,24 @@ export ANTHROPIC_API_KEY
 host/herdr-substrate.sh deploy
 unset ANTHROPIC_API_KEY
 ```
+
+**Or a Claude subscription** instead of an API key ([Claude credentials](../README.md#claude-credentials)): run
+`claude setup-token` on your workstation, and supply its token instead. `deploy` stores it under the
+Secret's `oauth-token` key, and the actors' egress policies inject it as `Authorization: Bearer`:
+
+```bash
+cd "$KIT_DIR"
+grep -q '^CLAUDE_AUTH=oauth-token' .env || sed -i.bak 's/^CLAUDE_AUTH=.*/CLAUDE_AUTH=oauth-token/' .env
+grep '^CLAUDE_AUTH' .env
+printf 'Token from claude setup-token: '; read -rs CLAUDE_CODE_OAUTH_TOKEN; printf '\n'
+export CLAUDE_CODE_OAUTH_TOKEN
+host/herdr-substrate.sh hub
+host/herdr-substrate.sh deploy
+unset CLAUDE_CODE_OAUTH_TOKEN
+```
+
+`hub` installs the matching default policy for `hubctl create`. To rotate the token, run the block again with a
+new one; the actors hold only a placeholder.
 
 Now scope the provider's access (step 11's last block), then create and use agents:
 

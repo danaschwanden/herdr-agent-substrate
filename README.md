@@ -178,6 +178,15 @@ Add your Anthropic API key. You are prompted for it, so it doesn't end up in you
 printf 'Anthropic API key: '; read -rs key; printf '\nANTHROPIC_API_KEY=%s\n' "$key" >> .env; unset key
 ```
 
+Or use your Claude subscription (Pro, Max, Team or Enterprise) instead of an API key. Create a token with
+`claude setup-token` on your machine (it opens your browser and prints a token valid for a year), then:
+
+```bash
+printf 'Token from claude setup-token: '; read -rs tok; printf '\nCLAUDE_AUTH=oauth-token\nCLAUDE_CODE_OAUTH_TOKEN=%s\n' "$tok" >> .env; unset tok
+```
+
+Either way the real credential stays out of the actors ([Claude credentials](#claude-credentials)).
+
 On Docker Desktop, select its `docker`-driver builder for image pushes to the kind registry:
 
 ```bash
@@ -294,7 +303,9 @@ host/herdr-substrate.sh verify luna
 ```
 
 Calls the Anthropic API from inside `luna` with the placeholder key. `OK: luna reached the Anthropic API with
-the injected key` proves the egress gateway substitutes the real key.
+the injected key` proves the egress gateway substitutes the real key. With `CLAUDE_AUTH=oauth-token` it asks
+Claude Code in `luna` for a one-word reply instead, and prints `OK: luna reached Claude with the injected
+subscription token`.
 
 ### 13. Run Claude Code in the actor
 
@@ -308,8 +319,8 @@ In herdr, select **luna** in the sidebar and open a workspace or tab on it (`+`)
 claude
 ```
 
-Claude Code asks once whether to use the API key from the environment: answer **yes**. That key is the
-placeholder; the real one never enters the actor. Give it a small task, and watch its state (working, idle)
+With an API key, Claude Code asks once whether to use the key from the environment: answer **yes**. That key
+is the placeholder; the real one never enters the actor. With a subscription token there is no question. Give it a small task, and watch its state (working, idle)
 in herdr's sidebar.
 
 Detach with `ctrl+b` then `q`. Claude and the actor keep running.
@@ -648,6 +659,38 @@ flowchart LR
   herdr client; nothing is lost on the hub or the actors.
 - **Turning it off.** `kubectl -n herdr-hub set env deployment/herdr-hub HUB_WEB=false` runs the hub without
   the web terminal.
+
+### Claude credentials
+
+`CLAUDE_AUTH` in `.env` decides how Claude Code in the actors authenticates. Both modes keep the real
+credential outside the sandbox: the actor gets a placeholder, and the egress gateway swaps in the real value
+on the way to `api.anthropic.com`.
+
+| | `api-key` (default) | `oauth-token` |
+|---|---|---|
+| Credential | an Anthropic API key from the Claude Console | a Claude subscription token from `claude setup-token` (Pro, Max, Team or Enterprise) |
+| Billing | per use, to the key's Console organization | the subscription's usage limits, shared by all actors |
+| You set | `ANTHROPIC_API_KEY` | `CLAUDE_CODE_OAUTH_TOKEN` |
+| The actor gets | `ANTHROPIC_API_KEY=placeholder…` | `CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-placeholder…` |
+| Claude Code sends | `x-api-key: placeholder…` | `Authorization: Bearer sk-ant-oat01-placeholder…` |
+| The egress policy replaces | `x-api-key` with the key | `authorization` with `Bearer ` and the token |
+| Policy file | `manifests/egress-policy.yaml.tmpl` | `manifests/egress-policy-oauth-token.yaml.tmpl` |
+| Stored as (k8s.io provider) | Secret `anthropic`, key `api-key` | Secret `anthropic`, key `oauth-token` |
+| Expires | when you revoke the key | a year after `setup-token`; create a new one before then |
+
+- **Only `api.anthropic.com`, in both modes.** A token from `setup-token` is only for model requests, so the
+  sign-in hosts (`claude.ai`, `platform.claude.com`) stay blocked. `test/claude-auth-test.sh` runs Claude Code
+  with each mode's placeholder against a stand-in gateway, and checks that every credential it sends is in the
+  header the policy replaces, and goes nowhere else.
+- **Not `/login` inside an actor.** That would put a refresh token for your account in the actor and in every
+  snapshot of it, and need one login per actor.
+- **One person per subscription.** A Pro or Max plan belongs to one person. If several people share the hub,
+  use Team or Enterprise seats, or an API key.
+- **Switching modes.** The template and each actor's egress policy are fixed when they're created, so switching
+  means: set `CLAUDE_AUTH` and its credential in `.env`, then `down`, `hub`, `deploy`, and recreate the actors.
+- **Rotating the token.** Run `claude setup-token` again, then re-run `deploy` with the new
+  `CLAUDE_CODE_OAUTH_TOKEN` (or add a new version of the secret in Secret Manager on GKE). The actors hold only
+  the placeholder, so they need no change.
 
 ### Trust and identity
 
@@ -1216,7 +1259,9 @@ Desktop, `BUILDX_BUILDER` (step 4); everything else has a working default.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — (required for `deploy`) | stored in a Secret; injected by the egress gateway |
+| `CLAUDE_AUTH` | `api-key` | `api-key` or `oauth-token`: how Claude Code authenticates ([Claude credentials](#claude-credentials)) |
+| `ANTHROPIC_API_KEY` | — (required for `deploy` with `api-key`) | stored in a Secret; injected by the egress gateway as `x-api-key` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — (required for `deploy` with `oauth-token`) | from `claude setup-token`; stored in a Secret; injected as `Authorization: Bearer` |
 | `SUBSTRATE_DIR` | `../substrate` | substrate checkout |
 | `BUILDX_BUILDER` | your current builder | must use the `docker` driver: `desktop-linux` on Docker Desktop, `default` on Linux |
 | `KIND_CLUSTER_NAME` | `kind` | |
@@ -1243,7 +1288,7 @@ The production guides add these. Their defaults are the quick start's.
 | `WORKER_IMAGE` | borrowed from the counter demo | digest-pinned `ateworker-gvisor` image for the WorkerPool |
 | `WORKER_NODE_SELECTOR` | `{}` | YAML flow map selecting the workers' nodes, e.g. `{"ate.dev/sandboxClass": "gvisor"}` |
 | `CREDENTIAL_PROVIDER` | `k8s.io` | the cluster's egress credential provider; any other value makes `deploy` skip the Secret and its grant |
-| `CREDENTIAL_URI` | `ate-secret://k8s.io/default/$SECRETS_NAMESPACE/anthropic/api-key` | key reference written into each actor's egress policy |
+| `CREDENTIAL_URI` | `ate-secret://k8s.io/default/$SECRETS_NAMESPACE/anthropic/api-key`, or `…/oauth-token` | credential reference written into each actor's egress policy |
 | `ATE_CLIENT_SERVICE_ACCOUNT` | — (substrate: `ate-client`) | read by kubectl-ate: the ServiceAccount in `ate-system` it acts as |
 | `ACTOR_IMAGE` | — (what `image` built) | prebuilt actor image, by tag or digest ([Prebuilt images](#prebuilt-images-from-github)) |
 | `HUB_IMAGE` | — (what `hub-image` built) | prebuilt hub image; its substrate release must match the cluster's |
@@ -1279,12 +1324,12 @@ fails in ways that look unrelated.
 | `manifests/hub-access-policy.yaml.tmpl` | atespace editor for the hub, nothing global |
 | `manifests/workerpool.yaml.tmpl` | gVisor WorkerPool for the actors; node selector from `WORKER_NODE_SELECTOR` |
 | `manifests/actor-template.yaml.tmpl` | the ActorTemplate (protojson for `kubectl ate create actor-template`) |
-| `manifests/egress-policy.yaml.tmpl` | per actor: only `api.anthropic.com`, with `x-api-key` injection from `CREDENTIAL_URI` |
-| `manifests/anthropic-secret.yaml.tmpl` | the real key, in its own namespace |
+| `manifests/egress-policy.yaml.tmpl`, `manifests/egress-policy-oauth-token.yaml.tmpl` | per actor: only `api.anthropic.com`, with `x-api-key` (API key) or `Authorization: Bearer` (subscription token) injection from `CREDENTIAL_URI` |
+| `manifests/anthropic-secret.yaml.tmpl` | the real key or token, in its own namespace |
 | `host/herdr-substrate.sh` | every command above |
 | `docs/production-gke.md`, `docs/production-kubernetes.md` | production deployments on GKE and on upstream Kubernetes |
 | `.github/workflows/images.yml` | builds and publishes `herdr-actor` and `herdr-hub` (per substrate release) to GHCR, multi-arch, with provenance |
-| `test/` | `keeper-test.py`, `local-bridge-test.sh`, `hub-path-test.sh`, `web-client.js` (drives the web terminal in Chromium), `fake_router.py`, `ssh_config.tmpl`, `Dockerfile.local` |
+| `test/` | `keeper-test.py`, `local-bridge-test.sh`, `hub-path-test.sh`, `claude-auth-test.sh`, `web-client.js` (drives the web terminal in Chromium), `fake_router.py`, `ssh_config.tmpl`, `Dockerfile.local` |
 | `.state/` | created by the script: image digests, the hub's public key, rendered manifests. Per checkout; safe to delete |
 
 ## Verification status
@@ -1318,6 +1363,7 @@ fails in ways that look unrelated.
 | Web terminal: ttyd in the hub listens on loopback only; headless Chromium types a command that runs on luna and shows in the tmux client too; closing the tab ends its herdr client; a new tab on a suspended luna wakes it | `test/hub-path-test.sh` steps 1, 10, 11 (31/31 in all) | pass |
 | Web terminal: a mouse selection reaches the clipboard, right-click opens herdr's menu with the browser's suppressed, `ctrl+v` pastes into luna. ttyd's own page does none of the three | same, step 12; the same checks against ttyd's default page | pass; default page fails all three |
 | `web`: forwards, checks the page answers, stops the port-forward on exit; reports a proxy-only hub (407) clearly | script run against a stub kubectl and ttyd | pass |
+| Both `CLAUDE_AUTH` modes: Claude Code 2.1.310 with the template's placeholder sends every credential in the header the rendered policy replaces (`x-api-key`, or `Authorization: Bearer`), never the other one, and only to `api.anthropic.com` | `test/claude-auth-test.sh`, gateway stand-in | 10/10 |
 | Scripts | `shellcheck` | clean |
 
 **Production guides** (build environment, 2026-10-25). They have not yet run against a real GKE or upstream
@@ -1379,6 +1425,13 @@ pip3 install websockets
 test/hub-path-test.sh herdr-actor:dev
 ```
 
+`claude-auth-test.sh` runs Claude Code from the actor image in both `CLAUDE_AUTH` modes against a stand-in for
+the egress gateway, on an isolated Docker network. It needs Docker, openssl and PyYAML (`pip3 install pyyaml`):
+
+```bash
+test/claude-auth-test.sh herdr-actor:dev
+```
+
 `KEEP=1` keeps the hub test's work directory for inspection.
 
 ## Design notes that came from testing
@@ -1419,7 +1472,7 @@ test/hub-path-test.sh herdr-actor:dev
 
 ## Security notes
 
-- The real API key lives only in a Secret the credential provider reads; actors send a placeholder that the egress
+- The real API key or subscription token lives only in a Secret the credential provider reads; actors send a placeholder that the egress
   gateway replaces. All other actor egress is denied.
 - The hub's SSH private key is generated on its volume and never leaves the cluster.
 - Router access is limited to the hub's SPIFFE identity; ate-api access to atespace editor on one atespace.
@@ -1484,6 +1537,8 @@ the hub.
 | `error: unknown machine '<name>'` | the `machine <name>` step hasn't completed; run it |
 | `machine '<name>' is disabled` | disabled by hand, or by an older version of this kit. `herdr machine enable <id>` in the hub; `idle-watch` re-enables `ate-*` machines when the hub starts |
 | Claude Code: "Unable to connect to Anthropic services … platform.claude.com: ENOTFOUND" | actor built from an older image without pre-completed onboarding. In its pane: `python3 -c 'import json,os;p=os.path.expanduser("~/.claude.json");d=json.load(open(p)) if os.path.exists(p) else {};d["hasCompletedOnboarding"]=True;json.dump(d,open(p,"w"))'` |
+| `verify` (`oauth-token`): "Claude Code could not use the injected token" | the token expired or was revoked (create one with `claude setup-token`, re-run `deploy`), the plan has no Claude Code access, or the actor still has the API-key policy from before a switch: recreate it |
+| Claude Code in an actor: `Invalid API key` or `401` after switching `CLAUDE_AUTH` | the template or the actor's egress policy still uses the old mode; both are fixed at creation. `down`, `hub`, `deploy`, then recreate the actors |
 | `verify`: "API answered with an error" | the gateway didn't inject the key: check the Secret, and that `deploy` granted the credential-provider policy |
 | `remote server is not ready for saved machines` | actor image without `setsid` (old build) or herdr version mismatch between hub and actor |
 | `REMOTE HOST IDENTIFICATION HAS CHANGED` | template recreated outside `deploy`; in the hub: `ssh-keygen -R herdr-substrate-herdr-agents -f ~/.ssh/known_hosts.herdr-substrate` |
@@ -1531,6 +1586,8 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   browser (`hub/herdr-web.js`). Before, ttyd ignored herdr's copies and the browser's menu covered herdr's.
 - **herdr in the browser:** the hub runs ttyd on its loopback, and the new `web` command port-forwards to it and
   opens the page. Each guide's step 14 adds a shared link behind sign-in: IAP on GKE, oauth2-proxy elsewhere.
+- **Claude subscription:** `CLAUDE_AUTH=oauth-token` uses a token from `claude setup-token` instead of an API
+  key, injected by the gateway as `Authorization: Bearer`. `verify` checks it with a one-word Claude Code reply.
 - **Agents from inside the hub:** `hubctl create <name> [--policy FILE]` and `hubctl delete <name>`. `hub` now
   also installs the default egress policy in the hub.
 - **Container `/tmp`:** the actor entrypoint sets `/tmp` and `/var/tmp` to mode 1777, which Claude Code needs

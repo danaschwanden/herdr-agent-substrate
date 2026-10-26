@@ -1,0 +1,21 @@
+# Per-actor egress policy for CLAUDE_AUTH=oauth-token, applied with
+#   kubectl ate create egress-policy <actor> -a ${ATESPACE} -f <rendered file>
+#
+# Default-deny everything except the Anthropic API. Claude Code sends its
+# subscription token (here a placeholder) as "Authorization: Bearer ..."; the
+# gateway terminates TLS for api.anthropic.com and replaces that header with
+# "Bearer " plus the real token from CREDENTIAL_URI. Requests without the
+# header pass unchanged. api.anthropic.com is the only host Claude Code needs
+# with such a token: sign-in hosts (claude.ai, platform.claude.com) are for
+# browser logins, which this setup doesn't use.
+#
+#   k8s.io (kind, upstream):  ate-secret://k8s.io/default/<namespace>/<secret>/<key>
+#   Secret Manager (GKE):     ate-secret://secretmanager.googleapis.com/projects/<p>/secrets/<s>/versions/<v>
+rules:
+- https:
+    hostnames: ["api.anthropic.com"]
+    effects:
+      replaceHeaders:
+      - header: authorization
+        prefix: "Bearer "
+        credentialUri: ${CREDENTIAL_URI}

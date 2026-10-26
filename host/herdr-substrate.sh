@@ -11,7 +11,7 @@
 # the environment, or from a .env file next to this kit's README.
 set -euo pipefail
 
-KIT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=/dev/null
 [[ -f "${KIT_DIR}/.env" ]] && set -a && . "${KIT_DIR}/.env" && set +a
 
@@ -57,7 +57,26 @@ CREDENTIAL_PROVIDER="${CREDENTIAL_PROVIDER:-k8s.io}"
 # The hub image's kubectl-ate must come from the cluster's substrate release.
 ACTOR_IMAGE="${ACTOR_IMAGE:-}"
 HUB_IMAGE="${HUB_IMAGE:-}"
-CREDENTIAL_URI="${CREDENTIAL_URI:-ate-secret://k8s.io/default/${SECRETS_NAMESPACE}/anthropic/api-key}"
+# How Claude Code in the actors authenticates. Either way the real credential
+# stays outside the sandbox: the actor holds a placeholder, and the egress
+# gateway swaps in the real one on the way to api.anthropic.com.
+#   api-key      an Anthropic API key (ANTHROPIC_API_KEY), billed per use;
+#                injected as the x-api-key header
+#   oauth-token  a Claude subscription token from `claude setup-token`
+#                (CLAUDE_CODE_OAUTH_TOKEN); injected as Authorization: Bearer
+CLAUDE_AUTH="${CLAUDE_AUTH:-api-key}"
+case "${CLAUDE_AUTH}" in
+  api-key)
+    CLAUDE_AUTH_ENV=ANTHROPIC_API_KEY
+    CLAUDE_AUTH_PLACEHOLDER=placeholder-replaced-by-egress-gateway
+    CREDENTIAL_KEY=api-key ;;
+  oauth-token)
+    CLAUDE_AUTH_ENV=CLAUDE_CODE_OAUTH_TOKEN
+    CLAUDE_AUTH_PLACEHOLDER=sk-ant-oat01-placeholder-replaced-by-egress-gateway
+    CREDENTIAL_KEY=oauth-token ;;
+  *) printf 'error: CLAUDE_AUTH must be api-key or oauth-token, got %s\n' "${CLAUDE_AUTH}" >&2; exit 1 ;;
+esac
+CREDENTIAL_URI="${CREDENTIAL_URI:-ate-secret://k8s.io/default/${SECRETS_NAMESPACE}/anthropic/${CREDENTIAL_KEY}}"
 STATE_DIR="${KIT_DIR}/.state"
 mkdir -p "${STATE_DIR}"
 
@@ -301,12 +320,23 @@ cmd_hub_image() {
   build_push "${KIT_DIR}/hub" herdr-hub
 }
 
-# The kit's egress policy for an actor: only api.anthropic.com, with the key
-# from CREDENTIAL_URI injected by the gateway. Used by `actor` and, through
-# the ConfigMap `hub` writes, by `hubctl create`.
+# The kit's egress policy for an actor: only api.anthropic.com, with the
+# credential from CREDENTIAL_URI injected by the gateway, in the header that
+# CLAUDE_AUTH calls for. Used by `actor` and, through the ConfigMap `hub`
+# writes, by `hubctl create`.
 render_egress_policy() {
-  ATESPACE="${ATESPACE}" CREDENTIAL_URI="${CREDENTIAL_URI}" \
-    render "${KIT_DIR}/manifests/egress-policy.yaml.tmpl" >"$1"
+  local tmpl="${KIT_DIR}/manifests/egress-policy.yaml.tmpl"
+  [[ "${CLAUDE_AUTH}" == oauth-token ]] && tmpl="${KIT_DIR}/manifests/egress-policy-oauth-token.yaml.tmpl"
+  ATESPACE="${ATESPACE}" CREDENTIAL_URI="${CREDENTIAL_URI}" render "${tmpl}" >"$1"
+}
+
+# The real credential for the k8s.io provider, from the environment.
+claude_credential() {
+  if [[ "${CLAUDE_AUTH}" == oauth-token ]]; then
+    printf '%s' "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+  else
+    printf '%s' "${ANTHROPIC_API_KEY:-}"
+  fi
 }
 
 cmd_hub() {
@@ -392,8 +422,11 @@ cmd_deploy() {
   # the key from the running hub when the local copy is missing.
   [[ -s "${STATE_DIR}/hub.pub" ]] || hub hubctl pubkey >"${STATE_DIR}/hub.pub" 2>/dev/null || true
   [[ -s "${STATE_DIR}/hub.pub" ]] || { rm -f "${STATE_DIR}/hub.pub"; die "no hub SSH key; run '$0 hub' first"; }
-  if [[ "${CREDENTIAL_PROVIDER}" == k8s.io ]]; then
-    [[ -n "${ANTHROPIC_API_KEY:-}" ]] || die "set ANTHROPIC_API_KEY (it goes into a Kubernetes Secret, never into the actors)"
+  if [[ "${CREDENTIAL_PROVIDER}" == k8s.io && -z "$(claude_credential)" ]]; then
+    if [[ "${CLAUDE_AUTH}" == oauth-token ]]; then
+      die "set CLAUDE_CODE_OAUTH_TOKEN to the token 'claude setup-token' printed (it goes into a Kubernetes Secret, never into the actors)"
+    fi
+    die "set ANTHROPIC_API_KEY (it goes into a Kubernetes Secret, never into the actors)"
   fi
 
   local worker_image="${WORKER_IMAGE}"
@@ -407,18 +440,19 @@ cmd_deploy() {
   export WORKER_IMAGE="${worker_image}"
   export ACTOR_IMAGE="${actor_image}"
   export AUTHORIZED_KEYS_JSON; AUTHORIZED_KEYS_JSON="$(json_quote <"${STATE_DIR}/hub.pub")"
+  export CLAUDE_AUTH_ENV CLAUDE_AUTH_PLACEHOLDER
 
   log "applying WorkerPool (${WORKER_REPLICAS} workers) in namespace ${K8S_NAMESPACE}"
   render "${KIT_DIR}/manifests/workerpool.yaml.tmpl" | k apply -f -
   k -n "${K8S_NAMESPACE}" rollout status deployment/herdr-agents --timeout=10m
 
   if [[ "${CREDENTIAL_PROVIDER}" == k8s.io ]]; then
-    log "storing the Anthropic key in ${SECRETS_NAMESPACE}/anthropic"
-    ANTHROPIC_API_KEY_JSON="$(printf '%s' "${ANTHROPIC_API_KEY}" | json_quote)" \
+    log "storing the ${CLAUDE_AUTH} in ${SECRETS_NAMESPACE}/anthropic"
+    CREDENTIAL_KEY="${CREDENTIAL_KEY}" CREDENTIAL_JSON="$(claude_credential | json_quote)" \
       render "${KIT_DIR}/manifests/anthropic-secret.yaml.tmpl" | k apply -f -
     grant_secret_namespace
   else
-    log "credential provider ${CREDENTIAL_PROVIDER}: the key stays in its store (${CREDENTIAL_URI})"
+    log "credential provider ${CREDENTIAL_PROVIDER}: the ${CLAUDE_AUTH} stays in its store (${CREDENTIAL_URI})"
   fi
 
   ate get atespace "${ATESPACE}" >/dev/null 2>&1 || ate create atespace "${ATESPACE}"
@@ -544,8 +578,24 @@ cmd_web() {
 cmd_verify() {
   local name="${1:-}"; [[ -n "${name}" ]] || die "usage: $0 verify <name>"
   validate_name "${name}"
-  log "calling api.anthropic.com from ${name} with the placeholder key"
   local out
+  if [[ "${CLAUDE_AUTH}" == oauth-token ]]; then
+    # A subscription token is meant for Claude Code, so check with Claude Code:
+    # one short reply from the smallest model, with the placeholder token.
+    log "asking Claude Code in ${name} for a one-word reply, with the placeholder token"
+    # shellcheck disable=SC2016 # expanded by the hub's shell
+    out="$(hub sh -c 'ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-$1" \
+      "cd /work && CLAUDE_CODE_OAUTH_TOKEN=$2 NODE_EXTRA_CA_CERTS=/run/ate/trust-bundle.pem timeout 120 claude -p \"Reply with the single word OK.\" --model haiku 2>&1"' \
+      sh "${name}" "${CLAUDE_AUTH_PLACEHOLDER}" 2>&1)" || true
+    if grep -q 'OK' <<<"${out}" && ! grep -qi 'error\|failed' <<<"${out}"; then
+      log "OK: ${name} reached Claude with the injected subscription token"
+    else
+      die "${name}: Claude Code could not use the injected token (egress policy, token, or plan?):
+${out:0:600}"
+    fi
+    return
+  fi
+  log "calling api.anthropic.com from ${name} with the placeholder key"
   # shellcheck disable=SC2016 # expanded by the hub's shell
   out="$(hub sh -c 'ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-$1" \
     "curl -sS --max-time 30 https://api.anthropic.com/v1/models -H x-api-key:placeholder -H anthropic-version:2023-06-01 --cacert /run/ate/trust-bundle.pem"' sh "${name}" 2>&1)" \
@@ -631,7 +681,7 @@ Usage: $0 <command> [args]
   resume <name>     via the hub: resume actor, wake the client sessions
   status            actors and herdr machines, as the hub sees them
   logs              follow the hub (idle bridge decisions)
-  verify <name>     check that actor <name> reaches the Anthropic API with the injected key
+  verify <name>     check that actor <name> reaches Anthropic with the injected key or token
   debug <name>      actor state and logs, hub logs, ssh -vvv from the hub
   down              delete actors, template, atespace, hub and namespaces
 EOF
@@ -663,4 +713,8 @@ main() {
   esac
 }
 
-main "$@"
+# Sourcing the script (as test/claude-auth-test.sh does) defines its settings
+# and functions without running a command.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -5,6 +5,7 @@
 #   ${ATESPACE}              substrate atespace for the actors
 #   ${ACTOR_IMAGE}           digest-pinned image in the kind registry
 #   ${AUTHORIZED_KEYS_JSON}  your SSH public key, JSON-quoted
+#   ${CLAUDE_AUTH_ENV} ${CLAUDE_AUTH_PLACEHOLDER}  the credential variable, by CLAUDE_AUTH
 metadata:
   atespace: ${ATESPACE}
   name: herdr-agent
@@ -17,11 +18,13 @@ containers:
   env:
   - name: AUTHORIZED_KEYS
     value: ${AUTHORIZED_KEYS_JSON}
-  # Claude Code sends this placeholder as x-api-key; the egress gateway swaps
-  # in the real key from a Kubernetes Secret (see egress-policy.yaml). The
-  # real key never enters the sandbox, its environment, or its snapshots.
-  - name: ANTHROPIC_API_KEY
-    value: "placeholder-replaced-by-egress-gateway"
+  # A placeholder credential, by CLAUDE_AUTH: ANTHROPIC_API_KEY (sent as
+  # x-api-key) or CLAUDE_CODE_OAUTH_TOKEN (sent as Authorization: Bearer). The
+  # egress gateway swaps in the real one from the credential provider (see
+  # egress-policy*.yaml.tmpl). It never enters the sandbox, its environment,
+  # or its snapshots.
+  - name: ${CLAUDE_AUTH_ENV}
+    value: "${CLAUDE_AUTH_PLACEHOLDER}"
   # Trust the egress gateway's MITM CA so it can inject the credential.
   # Node keeps its bundled public roots and adds this one.
   - name: NODE_EXTRA_CA_CERTS

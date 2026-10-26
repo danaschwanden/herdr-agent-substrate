@@ -507,6 +507,21 @@ printf '%s' "$key" | gcloud secrets create "$ANTHROPIC_SECRET" --replication-pol
 unset key
 ```
 
+**Or a Claude subscription** instead of an API key ([Claude credentials](../README.md#claude-credentials)): run
+`claude setup-token` on your workstation, store the token it prints in the same secret instead of a key, and
+record the choice so step 10 writes it into `.env`:
+
+```bash
+echo 'export CLAUDE_AUTH=oauth-token' >> ~/herdr-prod/gke.env
+source ~/herdr-prod/gke.env
+printf 'Token from claude setup-token: '; read -rs tok; printf '\n'
+printf '%s' "$tok" | gcloud secrets create "$ANTHROPIC_SECRET" --replication-policy=user-managed --locations="$REGION" --data-file=-
+unset tok
+```
+
+The token expires a year after `setup-token`. To rotate it, add a new version of the secret
+(`gcloud secrets versions add`); the egress policies point at `versions/latest`.
+
 Let the provider's Kubernetes ServiceAccount read **this one secret**, through its Workload Identity principal:
 
 ```bash
@@ -565,6 +580,7 @@ WORKER_IMAGE=${SUBSTRATE_REPO}/ateworker-gvisor@${WORKER_DIGEST}
 WORKER_NODE_SELECTOR='{"ate.dev/sandboxClass": "gvisor"}'
 WORKER_REPLICAS=3
 IDLE_SECONDS=900
+CLAUDE_AUTH=${CLAUDE_AUTH:-api-key}
 CREDENTIAL_PROVIDER=secretmanager.googleapis.com
 CREDENTIAL_URI=ate-secret://secretmanager.googleapis.com/projects/${PROJECT_ID}/secrets/${ANTHROPIC_SECRET}/versions/latest
 ATE_CLIENT_SERVICE_ACCOUNT=herdr-operator

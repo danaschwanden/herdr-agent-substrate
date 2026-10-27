@@ -47,7 +47,7 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/c
 # SHA-512. The installer has no version pin: rebuild to update, since the
 # CLI's self-updater can't reach Google from inside an actor.
 RUN curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh \
- && bash /tmp/agy-install.sh --dir /usr/local/bin --skip-path --skip-aliases \
+ && bash /tmp/agy-install.sh --dir /usr/local/bin \
  && rm -f /tmp/agy-install.sh \
  && agy --version
 
@@ -73,6 +73,11 @@ RUN cat /tmp/codex-config.toml >>/root/.codex/config.toml && rm /tmp/codex-confi
 # is needed. The API key prompt still appears once, for the placeholder key.
 RUN printf '{"hasCompletedOnboarding": true}\n' >/root/.claude.json
 
+# Shared with the hub image: the keeper <-> anchor protocol, and the log and
+# supervise helpers both entrypoints use. They come from the named build
+# context "common", the kit's common/ directory:
+#   docker buildx build --build-context common=common actor/
+COPY --from=common herdr_wire.py service.sh /usr/local/lib/herdr-substrate/
 COPY sshd_config /etc/ssh/sshd_config.d/actor.conf
 COPY herdr-config.toml /root/.config/herdr/config.toml
 COPY entrypoint.sh /usr/local/bin/herdr-actor-entrypoint

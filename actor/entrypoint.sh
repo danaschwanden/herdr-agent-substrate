@@ -9,14 +9,21 @@
 #
 # Environment (set in the ActorTemplate):
 #   AUTHORIZED_KEYS   required; SSH public key(s), one per line
-#   ACTOR_LISTEN      optional; websocat listen address (default 0.0.0.0:80)
-#   SSHD_PORT         optional; must match sshd_config (default 2222)
 set -euo pipefail
 
-log() { printf '[herdr-actor] %s\n' "$*" >&2; }
+# log and supervise, shared with the hub's entrypoint (common/service.sh).
+# shellcheck disable=SC2034 # read by service.sh
+LOG_TAG=herdr-actor RESTART_DELAY=1
+for lib in /usr/local/lib/herdr-substrate/service.sh "$(dirname "$(readlink -f "$0")")/../common/service.sh"; do
+  # shellcheck source=/dev/null
+  [[ -f "${lib}" ]] && { . "${lib}"; break; }
+done
+declare -F supervise >/dev/null || { echo "[herdr-actor] service.sh not found" >&2; exit 1; }
 
-ACTOR_LISTEN="${ACTOR_LISTEN:-0.0.0.0:80}"
-SSHD_PORT="${SSHD_PORT:-2222}"
+# Fixed: port 80 is the one port substrate's router forwards, and sshd_config
+# pins sshd to 127.0.0.1:2222.
+ACTOR_LISTEN=0.0.0.0:80
+SSHD_ADDR=127.0.0.1:2222
 SSH_STATE=/etc/ssh/actor
 
 if [[ -z "${AUTHORIZED_KEYS:-}" ]]; then
@@ -41,6 +48,9 @@ if [[ -s "${mitm_ca}" ]]; then
   mkdir -p /usr/local/share/ca-certificates
   cp "${mitm_ca}" /usr/local/share/ca-certificates/ate-egress-mitm.crt
   update-ca-certificates >/dev/null 2>&1 || log "WARNING: could not add the egress CA to the system store"
+else
+  log "WARNING: ${mitm_ca} is missing (no systemInfo trust bundle in the ActorTemplate?);" \
+      "Codex, agy and other native tools will fail TLS through the egress gateway"
 fi
 
 # --- agent CLIs ----------------------------------------------------------------
@@ -72,14 +82,6 @@ else
 fi
 
 # --- supervised services ---------------------------------------------------
-supervise() {
-  local name="$1"; shift
-  while true; do
-    log "starting ${name}"
-    "$@" || log "${name} exited with status $?"
-    sleep 1
-  done
-}
 
 /usr/sbin/sshd -t || { log "sshd config test failed"; exit 1; }
 
@@ -101,7 +103,7 @@ supervise herdr-anchor bash -c 'cd /work && exec herdr-anchor serve' &
 # and the timeout reaps tunnels whose peer vanished (e.g. across a suspend).
 supervise websocat websocat --binary --exit-on-eof \
   --ping-interval 20 --ping-timeout 60 \
-  "ws-l:${ACTOR_LISTEN}" "tcp:127.0.0.1:${SSHD_PORT}" &
+  "ws-l:${ACTOR_LISTEN}" "tcp:${SSHD_ADDR}" &
 
-log "ready: ws://${ACTOR_LISTEN} -> ssh 127.0.0.1:${SSHD_PORT}"
+log "ready: ws://${ACTOR_LISTEN} -> ssh ${SSHD_ADDR}"
 wait

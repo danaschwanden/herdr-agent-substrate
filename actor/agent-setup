@@ -7,10 +7,10 @@
 #   Codex        OPENAI_API_KEY: Codex reads keys only from its login, so the
 #                placeholder is stored with `codex login --with-api-key`
 #   agy          GEMINI_API_KEY: read only with modelProvider "gemini" in
-#                ~/.gemini/antigravity-cli/settings.json
+#                ~/.gemini/antigravity-cli/settings.json, which this sets
 #
 # Runs at boot (entrypoint), i.e. while substrate builds the golden snapshot.
-# Idempotent; leaves existing settings alone.
+# Idempotent: Codex keeps an existing login; agy's other settings are kept.
 set -euo pipefail
 log() { printf '[agent-setup] %s\n' "$*" >&2; }
 
@@ -25,14 +25,18 @@ if [[ -n "${OPENAI_API_KEY:-}" ]] && command -v codex >/dev/null; then
 fi
 
 if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+  # agy ignores GEMINI_API_KEY unless modelProvider is "gemini". Set it even
+  # over an existing value: the actor has no other way to sign in.
   settings="${HOME}/.gemini/antigravity-cli/settings.json"
   mkdir -p "$(dirname "${settings}")"
   python3 - "${settings}" <<'PY'
 import json, os, sys
 path = sys.argv[1]
 data = json.load(open(path)) if os.path.exists(path) else {}
-data.setdefault("modelProvider", "gemini")
+previous = data.get("modelProvider")
+data["modelProvider"] = "gemini"
 json.dump(data, open(path, "w"), indent=2)
+note = f" (was {previous})" if previous not in (None, "gemini") else ""
+print(f"[agent-setup] agy: modelProvider gemini{note}", file=sys.stderr)
 PY
-  log "agy: modelProvider $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["modelProvider"])' "${settings}")"
 fi

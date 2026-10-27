@@ -32,22 +32,32 @@ import json
 import os
 import re
 import secrets
-import signal
 import struct
 import sys
 import time
+
+
+def _import_wire():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.environ.get("HERDR_WIRE_DIR"), "/usr/local/lib/herdr-substrate",
+                 os.path.join(here, "..", "common")):
+        if path and os.path.exists(os.path.join(path, "herdr_wire.py")):
+            sys.path.insert(0, path)
+            break
+    import herdr_wire
+    return herdr_wire
+
+
+# The keeper <-> anchor protocol, shared with actor/herdr-anchor.
+wire = _import_wire()
 
 REAL_SSH = os.environ.get("HERDR_REAL_SSH", "/usr/bin/ssh")
 RUN_DIR = os.environ.get("HERDR_KEEPER_RUN", "/tmp/herdr-keepers")
 WAKE_TIMEOUT = float(os.environ.get("HERDR_KEEPER_WAKE_TIMEOUT", "180"))
 CONNECT_TIMEOUT = float(os.environ.get("HERDR_KEEPER_CONNECT_TIMEOUT", "120"))
 MAX_UNACKED = int(os.environ.get("HERDR_KEEPER_MAX_UNACKED", str(32 * 1024 * 1024)))
-ACK_EVERY = 256 * 1024
 MAX_FRAME = 64 * 1024 * 1024
 
-# Keeper <-> anchor messages (same as actor/herdr-anchor).
-HELLO, WELCOME, DATA, ACK, CLOSE, END = 1, 2, 3, 4, 5, 6
-HEADER = struct.Struct("<BI")
 
 # herdr ClientMessage variant tags (frozen for endpoint generation 1).
 TAG_RESIZE, TAG_DETACH = 3, 4
@@ -102,10 +112,6 @@ def pong_frame(data):
     return struct.pack("<I", len(payload)) + payload
 
 
-def encode(kind, payload=b""):
-    return HEADER.pack(kind, len(payload)) + payload
-
-
 class Fatal(Exception):
     pass
 
@@ -135,9 +141,7 @@ class Keeper:
         self.last_input = self.started
         self.last_output = self.started
         # client -> actor
-        self.up_buf = bytearray()
-        self.up_base = 0
-        self.up_total = 0
+        self.up = wire.ReplayBuffer()     # sent to the anchor, not yet acknowledged
         self.held = []                  # wake-class frames waiting for a connection
         self.deferred = {}              # tag -> latest deferrable frame
         # actor -> client
@@ -194,8 +198,14 @@ class Keeper:
     # --- client side -----------------------------------------------------------
     async def write_client(self, data):
         async with self.stdout_lock:
-            self.stdout.write(data)
-            await self.stdout.drain()
+            try:
+                self.stdout.write(data)
+                await self.stdout.drain()
+            except (ConnectionError, RuntimeError):
+                # The herdr client closed its end: same as it going away.
+                self.log("client went away (its end of the pipe closed)")
+                self.close_session()
+                os._exit(0)
 
     async def client_loop(self):
         """Read frames from the herdr client (our stdin)."""
@@ -242,17 +252,38 @@ class Keeper:
         elif self.state == "parked":
             self.wake("client input")
 
-    async def send_up(self, frame):
-        self.up_buf += frame
-        self.up_total += len(frame)
-        if len(self.up_buf) > MAX_UNACKED:
+    def push_up(self, frame):
+        """Queue a client frame for the actor, synchronously: frames reach the
+        anchor in exactly the order they are pushed, whatever awaits later."""
+        self.up.append(frame)
+        if len(self.up) > MAX_UNACKED:
             raise Fatal("too much unacknowledged client data")
         if self.up_writer is not None:
             try:
-                self.up_writer.write(encode(DATA, frame))
+                self.up_writer.write(wire.encode(wire.DATA, frame))
+            except (ConnectionError, RuntimeError):
+                self.upstream_lost("write failed")
+
+    async def drain_up(self):
+        if self.up_writer is not None:
+            try:
                 await self.up_writer.drain()
             except (ConnectionError, RuntimeError):
                 self.upstream_lost("write failed")
+
+    async def send_up(self, frame):
+        self.push_up(frame)
+        await self.drain_up()
+
+    def release_held(self):
+        """Queue what arrived while the actor was away (state first, then
+        input) and go awake, without an await in between: a frame the client
+        sends next can't overtake a held one."""
+        pending = [self.deferred[tag] for tag in sorted(self.deferred)] + self.held
+        self.deferred, self.held = {}, []
+        for frame in pending:
+            self.push_up(frame)
+        self.state = "awake"
 
     # --- actor side ------------------------------------------------------------
     async def reader_loop(self, reader):
@@ -264,18 +295,19 @@ class Keeper:
     async def _reader_loop(self, reader):
         try:
             while True:
-                header = await reader.readexactly(HEADER.size)
-                kind, length = HEADER.unpack(header)
-                payload = await reader.readexactly(length)
-                if kind == DATA:
+                kind, payload = await wire.read_message(reader)
+                if reader is not self.up_reader:
+                    # This connection was replaced (e.g. a write to it failed
+                    # first): whatever it still had buffered is stale. The new
+                    # connection's HELLO excluded it, so the anchor replays it
+                    # there; processing it here too would duplicate it.
+                    return
+                if kind == wire.DATA:
                     await self.from_actor(payload)
-                elif kind == ACK:
-                    (acked,) = struct.unpack("<Q", payload)
-                    if self.up_base <= acked <= self.up_total:
-                        del self.up_buf[: acked - self.up_base]
-                        self.up_base = acked
+                elif kind == wire.ACK:
+                    self.up.trim_to(wire.decode_ack(payload))
                     self.acked_event.set()
-                elif kind == END:
+                elif kind == wire.END:
                     reason = json.loads(payload).get("reason", "")
                     self.log(f"actor ended the session: {reason}")
                     raise Fatal(f"remote bridge ended: {reason}")
@@ -313,14 +345,14 @@ class Keeper:
                 frame = bytes(self.down_pending[:4 + length])
                 del self.down_pending[:4 + length]
                 await self.write_client(frame)
-        if self.down_unacked >= ACK_EVERY:
+        if self.down_unacked >= wire.ACK_EVERY:
             await self.send_ack()
 
     async def send_ack(self):
         self.down_unacked = 0
         if self.up_writer is not None:
             try:
-                self.up_writer.write(encode(ACK, struct.pack("<Q", self.down_total)))
+                self.up_writer.write(wire.encode_ack(self.down_total))
                 await self.up_writer.drain()
             except (ConnectionError, RuntimeError):
                 self.upstream_lost("ack failed")
@@ -364,34 +396,31 @@ class Keeper:
             env={**os.environ, "HERDR_KEEPER_BYPASS": "1"})
         err.close()
         reader, writer = self.proc.stdout, self.proc.stdin
-        hello = {"v": 1, "session": self.session, "recv": self.down_total,
+        hello = {"v": wire.PROTOCOL_VERSION, "session": self.session, "recv": self.down_total,
                  "cmd": None if resume else self.command}
-        writer.write(encode(HELLO, json.dumps(hello).encode()))
+        writer.write(wire.encode(wire.HELLO, json.dumps(hello).encode()))
         try:
             await writer.drain()
-            header = await reader.readexactly(HEADER.size)
+            kind, payload = await wire.read_message(reader)
         except (asyncio.IncompleteReadError, ConnectionError):
             if await self.proc.wait() == NO_ANCHOR_EXIT:
                 raise NoAnchor() from None
             raise
-        kind, length = HEADER.unpack(header)
-        payload = await reader.readexactly(length)
-        if kind != WELCOME:
+        if kind != wire.WELCOME:
             raise ConnectionError(f"expected WELCOME, got {kind}")
         welcome = json.loads(payload)
         if welcome["status"] == "unknown":
             raise Fatal("the actor no longer has this session (restarted or reverted)")
-        recv = int(welcome["recv"])
-        if not self.up_base <= recv <= self.up_total:
-            raise Fatal(f"anchor position {recv} outside {self.up_base}..{self.up_total}")
-        del self.up_buf[: recv - self.up_base]
-        self.up_base = recv
+        anchor_received = int(welcome["recv"])
+        if not self.up.trim_to(anchor_received):
+            raise Fatal(f"anchor position {anchor_received} outside {self.up.base}..{self.up.total}")
         self.session_open = True
         self.up_reader, self.up_writer = reader, writer
-        if self.up_buf:
-            writer.write(encode(DATA, bytes(self.up_buf)))
+        replay = self.up.since(self.up.base)
+        if replay:
+            writer.write(wire.encode(wire.DATA, replay))
         await writer.drain()
-        self.log(f"connected ({welcome['status']}; replayed {len(self.up_buf)} bytes)")
+        self.log(f"connected ({welcome['status']}; replayed {len(replay)} bytes)")
         self.reader_task = asyncio.create_task(self.reader_loop(reader))
         self.connected.set()
 
@@ -430,14 +459,8 @@ class Keeper:
                     self.log(f"connect failed ({error!r}); retrying in {delay:.0f}s")
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 10.0)
-            self.state = "awake"
-            # Deliver what arrived while we were away: state first, then input.
-            for tag in sorted(self.deferred):
-                await self.send_up(self.deferred[tag])
-            self.deferred.clear()
-            held, self.held = self.held, []
-            for frame in held:
-                await self.send_up(frame)
+            self.release_held()
+            await self.drain_up()
         except Fatal as error:
             await self.fail(str(error))
         finally:
@@ -487,7 +510,7 @@ class Keeper:
         deadline = time.monotonic() + timeout
         try:
             # 1. Everything we sent has reached the actor.
-            while self.up_base < self.up_total:
+            while self.up.base < self.up.total:
                 self.acked_event.clear()
                 await self.send_ack()
                 await asyncio.wait_for(self.acked_event.wait(), max(0.1, deadline - time.monotonic()))
@@ -519,18 +542,21 @@ class Keeper:
             self.state = "waking"
             self.wake(why)
             return "busy"
-        self.state = "awake"
-        held, self.held = self.held, []
-        deferred, self.deferred = self.deferred, {}
-
-        async def flush():
-            try:
-                for frame in [deferred[t] for t in sorted(deferred)] + held:
-                    await self.send_up(frame)
-            except Fatal as error:
-                await self.fail(str(error))
-        asyncio.create_task(flush())
+        try:
+            self.release_held()
+        except Fatal as error:
+            asyncio.create_task(self.fail(str(error)))
+            return "busy"
+        asyncio.create_task(self.drain_up())
         return "busy"
+
+    def close_session(self):
+        """Tell the anchor the client is gone, so it ends the bridge now."""
+        if self.up_writer is not None and self.state == "awake":
+            try:
+                self.up_writer.write(wire.encode(wire.CLOSE))
+            except (ConnectionError, RuntimeError):
+                pass
 
     async def fail(self, why):
         self.log(f"giving up: {why}")
@@ -560,9 +586,9 @@ class Keeper:
             self.wake("start")
             await self.client_loop()
             self.log("client went away")
-            if self.up_writer is not None and self.state == "awake":
+            self.close_session()
+            if self.up_writer is not None:
                 try:
-                    self.up_writer.write(encode(CLOSE))
                     await self.up_writer.drain()
                 except (ConnectionError, RuntimeError):
                     pass
@@ -586,7 +612,8 @@ def main():
                         help="after --: herdr's original ssh arguments, for actors without herdr-anchor")
     args = parser.parse_args()
     ssh_args = args.ssh_args[1:] if args.ssh_args[:1] == ["--"] else args.ssh_args
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # SIGPIPE stays ignored (Python's default): a write to a dead ssh process
+    # must surface as an error the keeper handles (it reconnects), not kill it.
     keeper = Keeper(args.target, args.command, ssh_args)
     asyncio.run(keeper.run())
     return 0

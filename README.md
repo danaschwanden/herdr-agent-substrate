@@ -598,6 +598,25 @@ frames, frozen message tags, and a named health ping and pong. If the bridge com
 the actor's image has no `herdr-anchor`, the keeper relays plainly and refuses to park. That machine then works
 like plain herdr, and hubctl won't suspend its actor while a client is attached.
 
+How the replay stays exact:
+
+- **One protocol, one file.** Keeper and anchor share `common/herdr_wire.py`: the message format and the replay
+  buffer both use. Each side counts the bytes it has received; on reconnect each replays everything past the
+  other's count.
+- **One connection at a time.** When a keeper reconnects, the anchor stops the old connection's relay *before* it
+  reports its count, and the keeper ignores anything still buffered on a connection it has replaced. Neither side
+  can deliver the same bytes twice.
+- **Order kept.** Frames held while the actor was away are queued before newer input, in one step, so input never
+  overtakes them.
+
+Anchor settings, in the actor's environment (none are set by the kit):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HERDR_ANCHOR_DETACHED_TTL` | `900` | seconds of awake time a session waits for its keeper before the anchor ends it |
+| `HERDR_ANCHOR_MAX_UNACKED` | 32 MiB | output the keeper hasn't acknowledged; past it the anchor ends the session and herdr reconnects normally |
+| `HERDR_ANCHOR_SOCKET` | `/run/herdr-anchor/anchor.sock` | the anchor's socket, root-only |
+
 
 #### Actor states
 
@@ -1369,6 +1388,7 @@ fails in ways that look unrelated.
 | `hub/hubctl` | create/delete agents, add/remove machines, suspend/resume (parking keepers), idle bridge, `ate` passthrough |
 | `hub/herdr-keeper`, `hub/ssh` | keeps each machine connection looking online while its actor is suspended; the `ssh` wrapper hands herdr's bridges to it |
 | `actor/herdr-anchor` | holds the hub's herdr session in the actor across suspends, replays after reconnects |
+| `common/herdr_wire.py`, `common/service.sh` | shared by both images (named build context `common`): the keeper↔anchor protocol and replay buffer; the entrypoints' `log` and `supervise` |
 | `manifests/hub.yaml.tmpl` | hub namespace (`ate.dev/api-access=true`), ServiceAccount, ClusterTrustBundle read RBAC, PVC, Deployment with projected identity, trust and token volumes |
 | `manifests/hub-access-policy.yaml.tmpl` | atespace editor for the hub, nothing global |
 | `manifests/workerpool.yaml.tmpl` | gVisor WorkerPool for the actors; node selector from `WORKER_NODE_SELECTOR` |
@@ -1410,7 +1430,7 @@ fails in ways that look unrelated.
 | Always-on: real herdr TUI attached; idle agent → keeper parked → actor suspended, machine stays enabled | same, suspend emulated with `docker pause` | pass |
 | Suspended: luna shows online for 45 s of health checks; nothing reaches the router; a resize doesn't wake it | same | pass |
 | A typed command wakes it: router resumes the actor, keeper rejoins the same session, output on screen | same | container up in 0.16 s, session resumed in 0.38 s |
-| Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor | `test/keeper-test.py` | 23/23 |
+| Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor, a takeover mid-stream delivers every byte exactly once | `test/keeper-test.py` | 26/26, 30 runs in a row; the code before the review fixes fails the reconnect check about 1 run in 4 and the takeover check every run |
 | Web terminal: ttyd in the hub listens on loopback only; headless Chromium types a command that runs on luna and shows in the tmux client too; closing the tab ends its herdr client; a new tab on a suspended luna wakes it | `test/hub-path-test.sh` steps 1, 10, 11 (31/31 in all) | pass |
 | Web terminal: a mouse selection reaches the clipboard, right-click opens herdr's menu with the browser's suppressed, `ctrl+v` pastes into luna. ttyd's own page does none of the three | same, step 12; the same checks against ttyd's default page | pass; default page fails all three |
 | `web`: forwards, checks the page answers, stops the port-forward on exit; reports a proxy-only hub (407) clearly | script run against a stub kubectl and ttyd | pass |
@@ -1456,7 +1476,7 @@ also needs ttyd and Node.js with Playwright (`brew install ttyd`, then `npm inst
 `npx playwright install chromium`; with a global install, set `NODE_PATH="$(npm root -g)"`).
 
 ```bash
-docker buildx build --load -t herdr-actor:dev actor/
+docker buildx build --build-context common=common --load -t herdr-actor:dev actor/
 ```
 
 ```bash
@@ -1599,6 +1619,7 @@ the hub.
 | `remote server is not ready for saved machines` | actor image without `setsid` (old build) or herdr version mismatch between hub and actor |
 | `REMOTE HOST IDENTIFICATION HAS CHANGED` | template recreated outside `deploy`; in the hub: `ssh-keygen -R herdr-substrate-herdr-agents -f ~/.ssh/known_hosts.herdr-substrate` |
 | An actor resumes right after being suspended | something connected through the router: input in a client (expected), or `verify`, `debug`, herdr's probes when a client starts. It is suspended again after `IDLE_SECONDS`; `logs` shows why it woke |
+| Keeper log: `the actor no longer has this session`, after a burst of output | the anchor ended the session at `HERDR_ANCHOR_MAX_UNACKED` (32 MiB) of unacknowledged output; herdr reconnects with a new session. The anchor's log in the actor says `dropping it` |
 | `logs`: `not suspending, keeper reported: busy` | someone typed while the keepers were parking; the next poll tries again |
 | `logs`: `not suspending, keeper reported: unsupported` | the actor's image has no `herdr-anchor` (built before it existed): it works, but can't be suspended under an attached client. Rebuild with `image`, then `down` and `deploy` to recreate the template |
 | A machine shows `reconnecting` after a long suspend | the resume took longer than `HERDR_KEEPER_WAKE_TIMEOUT` (180 s), or the actor lost its session (reverted, crashed, or the anchor's 15-minute cleanup ran). herdr reconnects by itself; the keeper log in the hub (`/tmp/herdr-keepers/<name>/`) says which |
@@ -1638,6 +1659,16 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   - **Idle detection:** idle means no working or blocked agent *and* no input, and only running actors are polled.
   - **Older images:** actors without the anchor fall back to a plain relay and aren't suspended under an
     attached client.
+- **Actor code review fixes** (review doc: "Code review: herdr-substrate actor/"):
+  - **Exactly-once replay.** Three races could duplicate, drop or reorder input across a reconnect: the anchor kept
+    relaying an old connection after a takeover, the keeper processed data from a connection it had replaced, and
+    held frames could be overtaken by newer input. All fixed, with a takeover test.
+  - **The keeper no longer dies on SIGPIPE** when its SSH connection breaks mid-write; it reconnects.
+  - **Sturdier anchor:** the bridge's idle-timeout flag is removed as a shell word in any quoting; a broken bridge
+    pipe is logged; the socket directory is forced to mode 0700.
+  - **Actor setup:** agy's `modelProvider` is always set to `gemini`; a missing gateway CA is logged; the unused
+    `ACTOR_LISTEN`/`SSHD_PORT` settings are gone.
+  - **Shared code:** the protocol and the entrypoints' helpers live once, in `common/`, built into both images.
 - **herdr in the browser:** copying a selection, pasting with `ctrl+v`, and herdr's right-click menu work in the
   browser (`hub/herdr-web.js`). Before, ttyd ignored herdr's copies and the browser's menu covered herdr's.
 - **herdr in the browser:** the hub runs ttyd on its loopback, and the new `web` command port-forwards to it and

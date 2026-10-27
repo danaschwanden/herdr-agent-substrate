@@ -45,6 +45,9 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/herdr /usr/local/bin/websocat /usr/local/bin/ttyd
 
 COPY bin/linux-${TARGETARCH}/kubectl-ate /usr/local/bin/kubectl-ate
+# Shared with the actor image (named build context "common", the kit's common/):
+# the keeper <-> anchor protocol and the entrypoints' log/supervise helpers.
+COPY --from=common herdr_wire.py service.sh /usr/local/lib/herdr-substrate/
 COPY ate-wss-proxy hubctl herdr-keeper herdr-web-index /usr/local/bin/
 COPY herdr-web.js /usr/local/share/herdr-hub/herdr-web.js
 # herdr runs `ssh` from PATH; this wrapper hands ate-* client bridges to

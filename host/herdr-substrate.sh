@@ -251,7 +251,10 @@ build_push() {
   platform="$(image_platform)"
   tag="${REGISTRY}/${name}:dev"
   meta="${STATE_DIR}/${name}-meta.json"
-  args=(--platform "${platform}" --build-arg "HERDR_VERSION=${HERDR_VERSION}")
+  # Both images take common/ (protocol and shell helpers they share) as the
+  # named build context "common".
+  args=(--platform "${platform}" --build-arg "HERDR_VERSION=${HERDR_VERSION}"
+        --build-context "common=${KIT_DIR}/common")
   [[ -n "${CLAUDE_CODE_VERSION}" ]] && args+=(--build-arg "CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION}")
   [[ -n "${CODEX_VERSION}" ]] && args+=(--build-arg "CODEX_VERSION=${CODEX_VERSION}")
   log "building ${tag} for ${platform} and pushing it to ${REGISTRY}"

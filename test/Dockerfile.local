@@ -17,6 +17,7 @@ COPY actor/herdr-config.toml /root/.config/herdr/config.toml
 COPY actor/entrypoint.sh /usr/local/bin/herdr-actor-entrypoint
 COPY actor/herdr-anchor /usr/local/bin/herdr-anchor
 COPY actor/agent-setup /usr/local/bin/agent-setup
+COPY common/herdr_wire.py common/service.sh /usr/local/lib/herdr-substrate/
 RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint /usr/local/bin/herdr-anchor /usr/local/bin/agent-setup
 WORKDIR /work
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/herdr-actor-entrypoint"]

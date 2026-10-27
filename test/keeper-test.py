@@ -125,6 +125,73 @@ def keeper_call(run, request, timeout=40):
     return json.loads(data)
 
 
+SLOW_BRIDGE = r"""
+import sys, time
+out = open(sys.argv[1], "wb")
+sys.stdout.write("ready\n"); sys.stdout.flush()
+while True:
+    b = sys.stdin.buffer.read(4096)
+    if not b:
+        break
+    out.write(b); out.flush()
+    time.sleep(0.002)
+"""
+
+
+async def takeover_test(work, sock):
+    """A second connection takes over a session while the first is still
+    sending, as a keeper does when it reconnects. Everything the bridge reads
+    must be the stream exactly once, in order."""
+    sys.path.insert(0, os.path.join(KIT, "common"))
+    import herdr_wire as wire
+    record = os.path.join(work, "takeover.bin")
+    slow = os.path.join(work, "slow_bridge.py")
+    open(slow, "w").write(SLOW_BRIDGE)
+    sid = "takeover-test-" + "x" * 12
+    cmd = f"exec python3 {slow} {record} remote-client-bridge"
+    stream = random.Random(7).randbytes(4 * 1024 * 1024)
+
+    async def hello(recv, with_cmd):
+        reader, writer = await asyncio.open_unix_connection(sock, limit=wire.MAX_MESSAGE)
+        writer.write(wire.encode(wire.HELLO, json.dumps(
+            {"v": 1, "session": sid, "recv": recv, "cmd": cmd if with_cmd else None}).encode()))
+        await writer.drain()
+        kind, payload = await asyncio.wait_for(wire.read_message(reader), 10)
+        assert kind == wire.WELCOME, kind
+        return reader, writer, json.loads(payload)
+
+    _, first, welcome = await hello(0, True)
+    check(welcome["status"] == "new", "first connection opens the session", str(welcome))
+
+    async def send_all():
+        for i in range(0, len(stream), 65536):
+            first.write(wire.encode(wire.DATA, stream[i:i + 65536]))
+            await first.drain()
+
+    sender = asyncio.create_task(send_all())
+    await asyncio.sleep(0.4)              # the bridge reads slowly: the anchor is mid-stream
+    reader, second, welcome = await hello(0, False)
+    sender.cancel()
+    first.close()
+    position = int(welcome["recv"])
+    check(welcome["status"] == "resumed" and 0 < position < len(stream),
+          f"takeover resumes mid-stream (anchor has {position} of {len(stream)} bytes)", str(welcome))
+    for i in range(position, len(stream), 65536):
+        second.write(wire.encode(wire.DATA, stream[i:i + 65536]))
+        await second.drain()
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and os.path.getsize(record) < len(stream):
+        await asyncio.sleep(0.2)
+    await asyncio.sleep(1)                # anything duplicated would arrive by now
+    got = open(record, "rb").read()
+    check(got == stream, "the bridge read the stream exactly once",
+          f"(read {len(got)} of {len(stream)} bytes; first difference at "
+          f"{next((i for i, (a, b) in enumerate(zip(got, stream)) if a != b), min(len(got), len(stream)))})")
+    second.write(wire.encode(wire.CLOSE))
+    await second.drain()
+    second.close()
+
+
 async def main():
     work = tempfile.mkdtemp(prefix="keeper-test-")
     run = os.path.join(work, "run")
@@ -220,9 +287,17 @@ async def main():
                     await asyncio.sleep(0.05)
         connects_before = open(os.path.join(work, "ssh.log")).read().count("connect")
         task = asyncio.create_task(sender())
-        received = [(await client.recv(timeout=60))[9:] for _ in payloads]
+        raw = [await client.recv(timeout=60) for _ in payloads]
+        received = [r[9:] for r in raw]
+        seqs = [struct.unpack("<I", r[1:5])[0] for r in raw]
         await task
-        check(received == payloads, f"{len(payloads)} frames ({sum(map(len, payloads)) // 1024} KiB) intact across a forced reconnect")
+        mismatch = next((i for i, (a, b) in enumerate(zip(received, payloads)) if a != b), None)
+        check(received == payloads, f"{len(payloads)} frames ({sum(map(len, payloads)) // 1024} KiB) intact across a forced reconnect",
+              f"(first mismatch at frame {mismatch}: server seq {seqs[max(0, (mismatch or 0) - 2):(mismatch or 0) + 3]},"
+              f" got payload #{next((j for j, q in enumerate(payloads) if mismatch is not None and q == received[mismatch]), None)},"
+              f" then #{next((j for j, q in enumerate(payloads) if mismatch is not None and mismatch + 1 < len(received) and q == received[mismatch + 1]), None)},"
+              f" got {len(received[mismatch]) if mismatch is not None else '-'} bytes,"
+              f" want {len(payloads[mismatch]) if mismatch is not None else '-'}; logs in {work})")
         connects = open(os.path.join(work, "ssh.log")).read().count("connect") - connects_before
         check(connects >= 1, f"the drop really forced a reconnect ({connects})")
         log = open(os.path.join(work, "anchor.log")).read()
@@ -289,6 +364,9 @@ async def main():
         check(reply.get("result") == "unsupported", "park refused, so hubctl won't suspend it", str(reply))
         old.stdin.close()
         await asyncio.wait_for(old.wait(), 10)
+
+        print("\n\033[1m10. a keeper takes over while input is in flight: nothing reaches the bridge twice\033[0m")
+        await takeover_test(work, sock)
     finally:
         if keeper.returncode is None:
             keeper.kill()

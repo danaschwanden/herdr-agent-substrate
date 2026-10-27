@@ -11,7 +11,14 @@
 # unattended hub never keeps actors awake.
 set -euo pipefail
 
-log() { printf '[herdr-hub] %s\n' "$*" >&2; }
+# log and supervise, shared with the hub's entrypoint (common/service.sh).
+# shellcheck disable=SC2034 # read by service.sh
+LOG_TAG=herdr-hub RESTART_DELAY=5
+for lib in /usr/local/lib/herdr-substrate/service.sh "$(dirname "$(readlink -f "$0")")/../common/service.sh"; do
+  # shellcheck source=/dev/null
+  [[ -f "${lib}" ]] && { . "${lib}"; break; }
+done
+declare -F supervise >/dev/null || { echo "[herdr-hub] service.sh not found" >&2; exit 1; }
 
 : "${ATESPACE:?ATESPACE is not set}"
 mkdir -p "${HOME}/.ssh" "${HOME}/.config/herdr"
@@ -51,14 +58,6 @@ for f in "${ATE_IDENTITY_BUNDLE:-/var/run/ate/identity/credential-bundle.pem}" \
          "${ATE_API_TOKEN:-/var/run/ate/api-token/token}"; do
   [[ -s "${f}" ]] || log "WARNING: ${f} is missing; check the pod's projected volumes"
 done
-
-supervise() {
-  local name="$1"; shift
-  while true; do
-    "$@" || log "${name} exited with status $?"
-    sleep 5
-  done
-}
 
 if [[ "${IDLE_WATCH:-true}" == "true" ]]; then
   supervise idle-watch hubctl idle-watch &

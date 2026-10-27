@@ -33,6 +33,7 @@ on:
     paths:
       - "actor/**"
       - "hub/**"
+      - "common/**"
       - ".github/workflows/images.yml"
   workflow_dispatch:
     inputs:
@@ -163,6 +164,8 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: actor
+          build-contexts: |
+            common=common
           platforms: ${{ env.PLATFORMS }}
           build-args: |
             CLAUDE_CODE_VERSION=${{ needs.plan.outputs.claude_code_version }}
@@ -275,6 +278,8 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: hub
+          build-contexts: |
+            common=common
           platforms: ${{ env.PLATFORMS }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

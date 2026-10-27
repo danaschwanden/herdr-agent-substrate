@@ -17,57 +17,61 @@ and both sides replay what the other hasn't received. The herdr server never
 sees a disconnect.
 
 The anchor relays bytes, not herdr messages: offsets count bytes in each
-direction, so it needs no knowledge of herdr's protocol.
+direction, so it needs no knowledge of herdr's protocol. The wire format is in
+common/herdr_wire.py, shared with the keeper.
 
-Wire format between keeper and anchor, both directions:
-    [u8 type][u32 little-endian length][payload]
-    1 HELLO    keeper->anchor  JSON {"v":1,"session":str,"cmd":str|null,"recv":int}
-    2 WELCOME  anchor->keeper  JSON {"status":"new"|"resumed"|"unknown","recv":int}
-    3 DATA     either way      raw bytes; offsets are implicit
-    4 ACK      either way      u64 little-endian: total bytes received so far
-    5 CLOSE    keeper->anchor  end the session (the herdr client went away)
-    6 END      anchor->keeper  JSON {"reason":str}: the bridge exited
+Settings (environment):
+    HERDR_ANCHOR_DETACHED_TTL  seconds of awake time a session waits for its
+                               keeper before it is closed (default 900)
+    HERDR_ANCHOR_MAX_UNACKED   bridge output kept for replay; a session that
+                               exceeds it is closed (default 32 MiB)
+    HERDR_ANCHOR_SOCKET        the daemon's socket (default below)
 """
 import argparse
 import asyncio
 import json
 import os
 import re
+import shlex
 import signal
 import socket
-import struct
 import sys
+import threading
 import time
 
+
+def _import_wire():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.environ.get("HERDR_WIRE_DIR"), "/usr/local/lib/herdr-substrate",
+                 os.path.join(here, "..", "common")):
+        if path and os.path.exists(os.path.join(path, "herdr_wire.py")):
+            sys.path.insert(0, path)
+            break
+    import herdr_wire
+    return herdr_wire
+
+
+wire = _import_wire()
+
 SOCKET = "/run/herdr-anchor/anchor.sock"
-HELLO, WELCOME, DATA, ACK, CLOSE, END = 1, 2, 3, 4, 5, 6
-HEADER = struct.Struct("<BI")
-MAX_MESSAGE = 64 * 1024 * 1024
 # A session whose keeper never comes back is closed after this many seconds
 # of *awake* time. Time spent suspended doesn't count: a parked session must
 # survive a suspend of any length.
 DETACHED_TTL = int(os.environ.get("HERDR_ANCHOR_DETACHED_TTL", "900"))
+# A session whose bridge has exited is kept this long for its keeper to come
+# back and read the END message, then dropped.
+ENDED_SESSION_TTL = 60
 # Unacknowledged output kept for replay. Beyond this the session is dropped
 # and the client reconnects normally.
 MAX_UNACKED = int(os.environ.get("HERDR_ANCHOR_MAX_UNACKED", str(32 * 1024 * 1024)))
-ACK_EVERY = 256 * 1024
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+IDLE_TIMEOUT_FLAG = "--idle-timeout-v1"
+# The flag as one shell word: bare or quoted, optionally with =value.
+IDLE_TIMEOUT_RE = re.compile(r"""[ \t]+(['"]?)--idle-timeout-v1(?:=[^\s'"]*)?\1(?=\s|$)""")
 
 
 def log(*parts):
     print("[herdr-anchor]", *parts, file=sys.stderr, flush=True)
-
-
-async def read_message(reader):
-    header = await reader.readexactly(HEADER.size)
-    kind, length = HEADER.unpack(header)
-    if length > MAX_MESSAGE:
-        raise ValueError(f"message of {length} bytes is too large")
-    return kind, await reader.readexactly(length)
-
-
-def encode(kind, payload=b""):
-    return HEADER.pack(kind, len(payload)) + payload
 
 
 def bridge_command(cmd):
@@ -76,50 +80,135 @@ def bridge_command(cmd):
     With --idle-timeout-v1 the bridge exits after 60 s without traffic, on a
     clock that includes suspended time. The anchor keeps the session itself
     and expires it by awake time instead.
+
+    herdr's command is a short shell script (a ready marker, then
+    `exec herdr ... remote-client-bridge [--idle-timeout-v1] ...`). The flag is
+    removed as a whole shell word, bare, quoted or with `=value`; the rest of
+    the script keeps its exact quoting. The result is checked by parsing it.
     """
-    return cmd.replace(" --idle-timeout-v1", "").replace(" '--idle-timeout-v1'", "")
+    stripped = IDLE_TIMEOUT_RE.sub("", cmd)
+    try:
+        left = [w for w in shlex.split(stripped)
+                if w == IDLE_TIMEOUT_FLAG or w.startswith(IDLE_TIMEOUT_FLAG + "=")]
+    except ValueError:
+        log("WARNING: could not parse the bridge command to check it")
+        return stripped
+    if left:
+        log(f"WARNING: {IDLE_TIMEOUT_FLAG} is still in the bridge command; the bridge may exit after a suspend")
+    return stripped
 
 
 class Session:
+    """One herdr client session: its bridge process and the keeper attached to it."""
+
     def __init__(self, sid, proc):
         self.sid = sid
         self.proc = proc
-        self.out = bytearray()     # bridge output not yet acknowledged by the keeper
-        self.out_base = 0          # offset of self.out[0]
-        self.out_total = 0         # bytes the bridge has produced
-        self.in_total = 0          # bytes received from the keeper
-        self.unacked_in = 0        # received since the last ACK we sent
-        self.writer = None         # current keeper transport
-        self.sent = 0              # output offset already written to self.writer
+        self.output = wire.ReplayBuffer()  # bridge output the keeper hasn't acknowledged
+        self.input_total = 0               # bytes received from the keeper
+        self.unacked_input = 0             # received since the last ACK we sent
+        self.writer = None                 # current keeper transport
+        self.handler = None                # the task relaying its input; may outlive
+                                           # the writer (a failed write detaches it)
+        self.sent = 0                      # output offset already written to self.writer
         self.end_sent = False
+        self.stdin_closed = False
         self.detached_ticks = 0
-        self.ended = None          # reason, once the bridge has exited
+        self.ended = None                  # reason, once the bridge has exited
         self.write_lock = asyncio.Lock()
+
+    @property
+    def tag(self):
+        return f"session {self.sid[:8]}"
 
     def attached(self):
         return self.writer is not None and not self.writer.is_closing()
 
-    async def flush(self):
-        """Write whatever output the current transport hasn't had yet."""
-        async with self.write_lock:
-            await self._flush_locked()
+    def append_output(self, chunk):
+        """Record bridge output. False once more than MAX_UNACKED is pending."""
+        self.output.append(chunk)
+        return len(self.output) <= MAX_UNACKED
 
-    async def _flush_locked(self, extra=b""):
+    def acknowledged(self, offset):
+        """The keeper has our output up to `offset`."""
+        self.output.trim_to(offset)
+
+    async def attach(self, writer, keeper_received, status):
+        """Make `writer` this session's transport: WELCOME, then replay."""
+        async with self.write_lock:
+            self.writer = writer
+            self.handler = asyncio.current_task()
+            self.detached_ticks = 0
+            self.end_sent = False
+            writer.write(wire.encode(wire.WELCOME, json.dumps(
+                {"status": status, "recv": self.input_total}).encode()))
+            # Replay everything the keeper hasn't seen; the keeper does the same.
+            self.output.trim_to(keeper_received)
+            self.sent = keeper_received
+            replayed = len(self.output)
+            await self._flush_locked()
+        return replayed
+
+    async def flush(self, trailer=b""):
+        """Write the output the transport hasn't had yet, then `trailer`
+        (an already encoded message, such as an ACK)."""
+        async with self.write_lock:
+            await self._flush_locked(trailer)
+
+    async def send_ack(self):
+        self.unacked_input = 0
+        await self.flush(wire.encode_ack(self.input_total))
+
+    async def _flush_locked(self, trailer=b""):
         if not self.attached():
             return
-        data = bytes(self.out[self.sent - self.out_base:])
+        data = self.output.since(self.sent)
         try:
             if data:
-                self.writer.write(encode(DATA, data))
-                self.sent = self.out_total
-            if extra:
-                self.writer.write(extra)
-            if self.ended and not self.end_sent and self.sent == self.out_total:
-                self.writer.write(encode(END, json.dumps({"reason": self.ended}).encode()))
+                self.writer.write(wire.encode(wire.DATA, data))
+                self.sent = self.output.total
+            if trailer:
+                self.writer.write(trailer)
+            if self.ended and not self.end_sent and self.sent == self.output.total:
+                self.writer.write(wire.encode(wire.END, json.dumps({"reason": self.ended}).encode()))
                 self.end_sent = True
             await self.writer.drain()
         except (ConnectionError, RuntimeError):
             self.detach(self.writer)
+
+    async def to_bridge(self, data):
+        """Input from the keeper. Counted as soon as it is handed to the
+        bridge, before any await: a takeover can then cancel this task only
+        before the write or after the count, never between them."""
+        if self.proc.returncode is None and not self.stdin_closed:
+            try:
+                self.proc.stdin.write(data)
+            except (BrokenPipeError, ConnectionResetError) as error:
+                self.stdin_closed = True
+                log(f"{self.tag}: bridge input closed ({error}); its output and END follow")
+        self.input_total += len(data)
+        self.unacked_input += len(data)
+        if not self.stdin_closed and self.proc.returncode is None:
+            try:
+                await self.proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as error:
+                self.stdin_closed = True
+                log(f"{self.tag}: bridge input closed ({error}); its output and END follow")
+        if self.unacked_input >= wire.ACK_EVERY:
+            await self.send_ack()
+
+    async def take_over(self):
+        """Detach the current keeper transport and wait until its handler has
+        stopped, so nothing it already read can reach the bridge after the new
+        transport's WELCOME has reported our position."""
+        old_writer, old_handler = self.writer, self.handler
+        self.handler = None
+        if old_writer is not None:
+            self.detach(old_writer)
+            old_writer.close()
+        if old_handler is not None and old_handler is not asyncio.current_task() and not old_handler.done():
+            old_handler.cancel()
+            await asyncio.wait([old_handler])
 
     def detach(self, writer):
         if self.writer is writer:
@@ -147,7 +236,7 @@ class Anchor:
         session = Session(sid, proc)
         self.sessions[sid] = session
         asyncio.create_task(self.pump_output(session))
-        log(f"session {sid[:8]}: bridge started (pid {proc.pid})")
+        log(f"{session.tag}: bridge started (pid {proc.pid})")
         return session
 
     async def pump_output(self, session):
@@ -155,64 +244,48 @@ class Anchor:
             chunk = await session.proc.stdout.read(65536)
             if not chunk:
                 break
-            session.out += chunk
-            session.out_total += len(chunk)
-            if len(session.out) > MAX_UNACKED:
-                log(f"session {session.sid[:8]}: {len(session.out)} unacknowledged bytes, dropping it")
+            if not session.append_output(chunk):
+                log(f"{session.tag}: over {MAX_UNACKED} unacknowledged bytes, dropping it")
                 session.kill()
                 break
             await session.flush()
         await session.proc.wait()
         session.ended = f"bridge exited with status {session.proc.returncode}"
-        log(f"session {session.sid[:8]}: {session.ended}")
+        log(f"{session.tag}: {session.ended}")
         await session.flush()
 
     def close(self, session, why):
         session.kill()
         if self.sessions.get(session.sid) is session:
             del self.sessions[session.sid]
-        log(f"session {session.sid[:8]}: closed ({why})")
+        log(f"{session.tag}: closed ({why})")
 
     async def handle(self, reader, writer):
         session = None
         try:
-            kind, payload = await read_message(reader)
-            if kind != HELLO:
+            kind, payload = await wire.read_message(reader)
+            if kind != wire.HELLO:
                 raise ValueError("expected HELLO")
             hello = json.loads(payload)
-            sid, recv = hello.get("session", ""), int(hello.get("recv", 0))
-            if hello.get("v") != 1 or not SESSION_RE.match(sid):
+            sid, keeper_received = hello.get("session", ""), int(hello.get("recv", 0))
+            if hello.get("v") != wire.PROTOCOL_VERSION or not SESSION_RE.match(sid):
                 raise ValueError("bad HELLO")
             session = self.sessions.get(sid)
-            if session is None and hello.get("cmd") and recv == 0:
+            if session is None and hello.get("cmd") and keeper_received == 0:
                 session = await self.new_session(sid, hello["cmd"])
                 status = "new"
-            elif session is not None and session.out_base <= recv <= session.out_total:
+            elif session is not None and session.output.holds(keeper_received):
                 status = "resumed"
+                await session.take_over()
             else:
-                writer.write(encode(WELCOME, json.dumps({"status": "unknown", "recv": 0}).encode()))
+                writer.write(wire.encode(wire.WELCOME, json.dumps({"status": "unknown", "recv": 0}).encode()))
                 await writer.drain()
-                log(f"session {sid[:8]}: unknown or not resumable (recv {recv})")
+                log(f"session {sid[:8]}: unknown or not resumable (recv {keeper_received})")
                 return
-            if session.attached():
-                old = session.writer
-                session.detach(old)
-                old.close()
-            async with session.write_lock:
-                session.writer = writer
-                session.detached_ticks = 0
-                session.end_sent = False
-                writer.write(encode(WELCOME, json.dumps(
-                    {"status": status, "recv": session.in_total}).encode()))
-                # Replay everything the keeper hasn't seen; the keeper does the same.
-                del session.out[: recv - session.out_base]
-                session.out_base = recv
-                session.sent = recv
-                replay = len(session.out)
-                await session._flush_locked()
+            replayed = await session.attach(writer, keeper_received, status)
             if status == "resumed":
-                log(f"session {sid[:8]}: resumed (replayed {replay} bytes)")
-            await self.relay(session, reader, writer)
+                log(f"{session.tag}: resumed (replayed {replayed} bytes)")
+            await self.relay(session, reader)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         except Exception as error:  # noqa: BLE001 - keep the daemon up
@@ -220,36 +293,27 @@ class Anchor:
         finally:
             if session is not None:
                 session.detach(writer)
+                if session.handler is asyncio.current_task():
+                    session.handler = None
             writer.close()
 
-    async def relay(self, session, reader, writer):
+    async def relay(self, session, reader):
+        me = asyncio.current_task()
         while True:
-            kind, payload = await read_message(reader)
-            if kind == DATA:
-                if session.proc.returncode is None:
-                    session.proc.stdin.write(payload)
-                    await session.proc.stdin.drain()
-                session.in_total += len(payload)
-                session.unacked_in += len(payload)
-                if session.unacked_in >= ACK_EVERY:
-                    await self.send_ack(session)
-            elif kind == ACK:
-                (acked,) = struct.unpack("<Q", payload)
-                if session.out_base <= acked <= session.out_total:
-                    del session.out[: acked - session.out_base]
-                    session.out_base = acked
+            kind, payload = await wire.read_message(reader)
+            if session.handler is not me:
+                return  # replaced by a newer connection; its keeper replays this
+            if kind == wire.DATA:
+                await session.to_bridge(payload)
+            elif kind == wire.ACK:
+                session.acknowledged(wire.decode_ack(payload))
                 # Answer with our own position, so the keeper can trim too.
-                await self.send_ack(session)
-            elif kind == CLOSE:
+                await session.send_ack()
+            elif kind == wire.CLOSE:
                 self.close(session, "keeper closed it")
                 return
             else:
                 raise ValueError(f"unexpected message type {kind}")
-
-    async def send_ack(self, session):
-        session.unacked_in = 0
-        async with session.write_lock:
-            await session._flush_locked(encode(ACK, struct.pack("<Q", session.in_total)))
 
     async def reap(self):
         # Counted in one-second ticks rather than by clock: after a restore
@@ -262,19 +326,22 @@ class Anchor:
                 session.detached_ticks += 1
                 if session.detached_ticks >= DETACHED_TTL:
                     self.close(session, f"no keeper for {DETACHED_TTL}s of awake time")
-                elif session.ended and session.detached_ticks >= 60:
+                elif session.ended and session.detached_ticks >= ENDED_SESSION_TTL:
                     self.close(session, "bridge ended and nobody came back")
 
 
 async def serve(path):
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    # makedirs leaves an existing directory's mode alone; the socket is root-only.
+    os.chmod(directory, 0o700)
     try:
         os.unlink(path)
     except FileNotFoundError:
         pass
     anchor = Anchor()
     old_umask = os.umask(0o177)
-    server = await asyncio.start_unix_server(anchor.handle, path=path, limit=MAX_MESSAGE)
+    server = await asyncio.start_unix_server(anchor.handle, path=path, limit=wire.MAX_MESSAGE)
     os.umask(old_umask)
     log(f"listening on {path} (detached sessions expire after {DETACHED_TTL}s awake)")
     asyncio.create_task(anchor.reap())
@@ -301,8 +368,6 @@ def attach(path):
                 print("herdr-anchor: anchor is not running", file=sys.stderr)
                 return 1
             time.sleep(0.2)
-
-    import threading
 
     def upload():
         try:

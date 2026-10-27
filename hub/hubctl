@@ -4,9 +4,9 @@
 # Every actor's herdr machine stays enabled and looks online all the time.
 # Suspending is invisible to the herdr client because herdr-keeper sits
 # between the client and each actor (see hub/herdr-keeper, actor/herdr-anchor):
-#   suspend: park the keepers (they drain, drop their connection and answer
-#            the client's health pings themselves), cut leftover tunnels,
-#            then suspend the actor;
+#   suspend: park the keepers (they drop their connection and answer the
+#            client's health pings themselves), cut leftover tunnels, then
+#            suspend the actor;
 #   resume:  happens by itself on the next keystroke or request: the keeper
 #            reconnects through the router, which resumes the actor.
 set -euo pipefail
@@ -45,37 +45,12 @@ validate_name() {
 
 # machine_id LABEL: herdr profile id of the saved machine with that label.
 machine_id() {
-  herdr machine list --json | python3 -c '
-import json, sys
-rows = [r for r in json.load(sys.stdin) if r["label"] == sys.argv[1]]
-print(rows[0]["id"] if rows else "")' "$1"
+  herdr machine list --json | jq -r --arg want "$1" 'first(.[] | select(.label == $want) | .id) // empty'
 }
 
-# ate_machines FIELD [disabled]: FIELD (label or id) of every saved ate-*
-# machine, one per line; with "disabled", only the disabled ones.
-ate_machines() {
-  herdr machine list --json | python3 -c '
-import json, sys
-field, only_disabled = sys.argv[1], sys.argv[2:] == ["disabled"]
-for r in json.load(sys.stdin):
-    if r["target"].startswith("ate-") and not (only_disabled and r["enabled"]):
-        print(r[field])' "$@"
-}
-
-# park_refusals: reads keeper replies to a park request, prints the ones that
-# did not park (comma-separated), nothing if all parked.
-park_refusals() {
-  python3 -c '
-import json, sys
-bad = []
-for line in sys.stdin.read().splitlines():
-    try:
-        reply = json.loads(line)
-    except ValueError:
-        bad.append(line); continue
-    if reply.get("result") != "parked":
-        bad.append(reply.get("result") or reply.get("error") or line)
-print(", ".join(bad))'
+# ate_labels: the label of every saved ate-* machine, one per line.
+ate_labels() {
+  herdr machine list --json | jq -r '.[] | select(.target | startswith("ate-")) | .label'
 }
 
 cut_tunnel() { pkill -f -- "ate-target-actor: ${ATESPACE}/$1\$" 2>/dev/null || true; }
@@ -86,10 +61,9 @@ keepers() {
   python3 - "${KEEPER_RUN}/$1" "$2" <<'PY'
 import glob, json, os, socket, sys
 directory, request = sys.argv[1], sys.argv[2]
-timeout = float(json.loads(request).get("timeout", 5)) + 10
 for path in sorted(glob.glob(os.path.join(directory, "*.sock"))):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+    sock.settimeout(15)
     try:
         sock.connect(path)
         sock.sendall(request.encode() + b"\n")
@@ -112,16 +86,14 @@ for path in sorted(glob.glob(os.path.join(directory, "*.sock"))):
 PY
 }
 
+# keeper_replies FILTER: run a jq FILTER over the replies `keepers` printed,
+# one parsed reply at a time; a line that isn't JSON becomes {"error": line}.
+keeper_replies() { jq -Rr "select(length > 0) | (fromjson? // {error: .}) | $1"; }
+
 # actor_states: "<name> <state>" for every actor in the atespace.
 actor_states() {
-  ate get actors -a "${ATESPACE}" -o json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except ValueError:
-    sys.exit()
-for actor in data.get("actors", []):
-    print(actor["metadata"]["name"], actor.get("status", {}).get("state", "UNKNOWN"))'
+  ate get actors -a "${ATESPACE}" -o json 2>/dev/null \
+    | jq -r '.actors[]? | "\(.metadata.name) \(.status.state // "UNKNOWN")"' 2>/dev/null || true
 }
 
 cmd_add() {
@@ -130,8 +102,6 @@ cmd_add() {
   # -F: OpenSSH finds ~/.ssh/config through the password database, not $HOME.
   ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-${name}" 'herdr --version' >/dev/null \
     || die "ssh ate-${name} failed; try: ssh -F ~/.ssh/config -vvv ate-${name} true"
-  ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-${name}" 'test -x /usr/local/bin/herdr-anchor' \
-    || log "WARNING: actor ${name} has no herdr-anchor (older image): it can't be suspended while a client is attached"
   if [[ -n "$(machine_id "${name}")" ]]; then
     log "machine ${name} already saved"
   else
@@ -201,23 +171,19 @@ cmd_remove() {
 }
 
 # suspend NAME [--force]: park NAME's keepers, then suspend the actor. Without
-# --force, a keeper that sees user input (or can't park) cancels the suspend.
-# With --force, keepers that could not park cleanly drop their connection
-# anyway and hold what they had (the anchor replays it on the next wake), so
-# the actor stays suspended until the next input.
+# --force, a keeper whose client is in use (recent input or output) cancels
+# the suspend. With --force, keepers park anyway; what they hold is replayed
+# on the next wake, so the actor stays suspended until the next input.
 cmd_suspend() {
-  local name="${1:?usage: hubctl suspend <actor> [--force]}" force="${2:-}" refused
+  local name="${1:?usage: hubctl suspend <actor> [--force]}" force=false refused
   validate_name "${name}"
-  refused="$(keepers "${name}" '{"cmd":"park","timeout":30}' | park_refusals)"
+  [[ "${2:-}" == --force ]] && force=true
+  refused="$(keepers "${name}" "{\"cmd\":\"park\",\"force\":${force}}" \
+    | keeper_replies 'select(.result != "parked") | .result // .error' | paste -sd, -)"
   if [[ -n "${refused}" ]]; then
-    if [[ "${force}" != --force ]]; then
-      log "${name}: not suspending, keeper reported: ${refused}"
-      return 3
-    fi
-    log "${name}: keeper reported ${refused}; forcing"
-    refused="$(keepers "${name}" '{"cmd":"park","force":true,"timeout":30}' | park_refusals)"
-    [[ -z "${refused}" ]] \
-      || log "${name}: WARNING: keeper could not park (${refused}); it will resume the actor when it reconnects"
+    [[ "${force}" == true ]] \
+      || { log "${name}: not suspending, keeper reported: ${refused}"; return 3; }
+    log "${name}: WARNING: keeper could not park (${refused}); it will resume the actor when it connects"
   fi
   # herdr's own SSH master (probes, --machine calls) keeps sending keepalives
   # for up to 10 minutes; parked keepers have no connection left to cut.
@@ -233,39 +199,24 @@ cmd_resume() {
   ate_actor resume actor "${name}"
   # Attached clients: reconnect now rather than on the next keystroke.
   keepers "${name}" '{"cmd":"wake"}' >/dev/null
-  date +%s >"${STATE_DIR}/last-active.${name}"
 }
 
-# agents_busy LABEL: prints busy, idle or unknown.
+# agents_busy LABEL: prints busy, idle or unknown (the list can't be read).
 agents_busy() {
-  herdr --machine "$1" agent list 2>/dev/null | python3 -c '
-import json, sys
-try:
-    agents = json.load(sys.stdin)["result"]["agents"]
-except Exception:
-    print("unknown"); sys.exit()
-print("busy" if any(a.get("agent_status") in ("working", "blocked") for a in agents) else "idle")'
+  local verdict
+  verdict="$(herdr --machine "$1" agent list 2>/dev/null | jq -r '
+    .result.agents
+    | if type != "array" then "unknown"
+      elif any(.[]; .agent_status == "working" or .agent_status == "blocked") then "busy"
+      else "idle" end' 2>/dev/null)" || true
+  echo "${verdict:-unknown}"
 }
 
 # input_idle LABEL: seconds since anyone typed into or opened LABEL in an
 # attached herdr client (the smallest across keepers); empty if none attached.
 input_idle() {
-  keepers "$1" '{"cmd":"status"}' | python3 -c '
-import json, sys
-idle = [json.loads(l).get("input_idle") for l in sys.stdin.read().splitlines() if l.strip()]
-idle = [i for i in idle if isinstance(i, (int, float))]
-print(int(min(idle)) if idle else "")'
-}
-
-# Machines saved before the always-on keeper were disabled while suspended.
-# A one-time migration: once done, a machine disabled on purpose stays so.
-enable_all() {
-  local id done_marker="${STATE_DIR}/migrated-always-on"
-  [[ -f "${done_marker}" ]] && return 0
-  for id in $(ate_machines id disabled); do
-    herdr machine enable "${id}" >/dev/null && log "re-enabled machine ${id}"
-  done
-  touch "${done_marker}"
+  keepers "$1" '{"cmd":"status"}' | keeper_replies '.input_idle | numbers' \
+    | sort -n | head -n 1 | cut -d. -f1
 }
 
 # touch_marker FILE TIME: move the last-activity marker forward to TIME, never
@@ -286,7 +237,7 @@ idle_pass() {
   while read -r name state; do
     [[ -n "${name}" ]] && states["${name}"]="${state}"
   done < <(actor_states)
-  for name in $(ate_machines label); do
+  for name in $(ate_labels); do
     marker="${STATE_DIR}/last-active.${name}"
     unknown="${STATE_DIR}/agents-unknown.${name}"
     if [[ "${states[${name}]:-}" != ACTOR_STATE_RUNNING ]]; then
@@ -318,7 +269,6 @@ idle_pass() {
 
 cmd_idle_watch() {
   log "idle bridge: suspend actors after ${IDLE_SECONDS}s without working/blocked agents or input"
-  enable_all || true
   while :; do
     idle_pass || log "idle pass failed"
     sleep "${POLL_SECONDS}"
@@ -330,13 +280,9 @@ cmd_status() {
   echo
   herdr machine list || true
   local name
-  for name in $(ate_machines label 2>/dev/null); do
-    keepers "${name}" '{"cmd":"status"}' | python3 -c '
-import json, sys
-for line in sys.stdin.read().splitlines():
-    s = json.loads(line)
-    if "state" in s:
-        print("keeper {machine} (pid {pid}): {state}, input idle {input_idle}s".format(**s))'
+  for name in $(ate_labels 2>/dev/null); do
+    keepers "${name}" '{"cmd":"status"}' \
+      | keeper_replies 'select(.state) | "keeper \(.machine) (pid \(.pid)): \(.state), input idle \(.input_idle)s"'
   done
 }
 

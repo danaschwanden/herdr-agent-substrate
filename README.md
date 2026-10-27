@@ -545,8 +545,10 @@ timer only ever moves forward: input from a while ago never undoes a more recent
 
 An actor with neither for `IDLE_SECONDS` is suspended:
 
-1. Its keepers park. Each one waits until everything it sent is acknowledged and the actor has gone quiet, then
-   drops its SSH session. Input arriving meanwhile cancels the suspend.
+1. Its keepers park: each drops its SSH session at once. Nothing needs draining first, because whatever either
+   side hasn't acknowledged is replayed on the next wake. A keeper refuses, and so cancels the suspend, if its
+   client typed in the last 2 seconds or the actor sent output in the last second. Input that arrives just after
+   the park doesn't cancel anything: it wakes the actor again.
 2. Leftover tunnels are cut. herdr's own SSH master, used for its probes, would otherwise keep sending keepalives
    for up to 10 minutes (`ControlPersist=600`).
 3. `kubectl-ate suspend actor` runs, as `system:serviceaccount:herdr-hub:herdr-hub` (atespace editor).
@@ -605,9 +607,10 @@ sequenceDiagram
 ```
 
 The keeper depends only on herdr's endpoint protocol, which herdr's source declares a stable contract: length-prefixed
-frames, frozen message tags, and a named health ping and pong. If the bridge command doesn't look as expected, or
-the actor's image has no `herdr-anchor`, the keeper relays plainly and refuses to park. That machine then works
-like plain herdr, and hubctl won't suspend its actor while a client is attached.
+frames, frozen message tags, and a named health ping and pong. If the bridge command doesn't look as expected (no
+ready marker), the `ssh` wrapper runs the real ssh instead of a keeper: that machine works like plain herdr, and
+can't be parked. An actor whose image has no `herdr-anchor` (built before it existed) isn't supported: its keeper
+exits with "rebuild its image", and herdr shows the machine as failing to connect.
 
 How the replay stays exact:
 
@@ -686,13 +689,13 @@ flowchart LR
 - **Copy, paste and right-click.** The hub serves ttyd's page with a small script added (`hub/herdr-web.js`), so
   the browser behaves like a desktop terminal running herdr:
   - **Copy:** select with the mouse as in herdr anywhere. herdr copies the selection (as OSC 52), the script puts
-    it on your clipboard, and "Copied" shows in the corner.
+    it on your clipboard.
   - **Paste:** `cmd+v` on macOS, `ctrl+v` or `ctrl+shift+v` elsewhere. It arrives as one paste, not as typing.
   - **Right-click** opens herdr's menu; the browser's own menu stays out of the way.
 
-  Clipboard access needs a secure page: `http://localhost` (as `web` uses) or `https`. Tested in Chromium. Other
-  browsers may refuse a copy that doesn't follow a click closely enough (Safari is the strictest); the corner then
-  says the browser blocked it.
+  Clipboard access needs a secure page: `http://localhost` (as `web` uses) or `https`, which is all the kit
+  serves. Tested in Chromium. Other browsers may refuse a copy that doesn't follow a click closely enough (Safari
+  is the strictest); the browser's console then shows "herdr: copy failed".
 - **Keys.** Keys go to herdr, including its `ctrl+b` prefix, except the ones the browser keeps for itself, such
   as `ctrl+w` and `ctrl+t`.
 - **Dropped connections.** ttyd pings every 5 seconds, which keeps proxies from closing an idle tab. If the
@@ -1195,7 +1198,7 @@ sequenceDiagram
   rect rgba(128,128,128,0.08)
   Note over S,W: suspend NAME
   S->>H: hubctl suspend NAME
-  H->>H: park NAME's keepers (input cancels), cut leftover tunnels
+  H->>H: park NAME's keepers (recent input cancels), cut leftover tunnels
   H->>A: SuspendActor, path 2
   A->>W: checkpoint memory, free the worker<br/>snapshot uploaded to rustfs in the background
   end
@@ -1210,10 +1213,9 @@ sequenceDiagram
 
 Both run in the hub, because the keepers live there and the order matters: they must be parked before the
 suspend. `hubctl idle-watch` runs the same suspend automatically (see [Lifecycle](#lifecycle)). `suspend` refuses
-while someone is typing, or when a keeper can't park; `suspend NAME --force` (in the hub: `hubctl suspend NAME
---force`) suspends anyway, and the next input wakes the actor again. A forced park drops the keeper's connection
-without waiting: unacknowledged input and output stay buffered on both ends and are replayed on that next wake.
-Only keepers whose first connection isn't up yet, and actors from older images (plain relay), still can't park.
+while someone is typing or the actor is printing; `suspend NAME --force` (in the hub: `hubctl suspend NAME
+--force`) suspends anyway, and the next input wakes the actor again. Only a keeper whose first connection isn't up
+yet can't park, even forced.
 
 #### `delete <name>`
 
@@ -1388,6 +1390,7 @@ These are read by the hub container itself and aren't applied by `hub`. Set them
 | `IDLE_WATCH` | `true` | `false` runs the hub without the idle bridge: nothing is suspended automatically |
 | `HUB_WEB` | `true` | `false` runs the hub without the web terminal |
 | `HUB_WEB_PORT` | `7681` | ttyd's port in the pod (the manifest's `containerPort` and Service assume 7681) |
+| `HUB_WEB_INDEX` | `/usr/local/share/herdr-hub/index.html` | the page ttyd serves; the image builds it with `hub/herdr-web-index` |
 | `HERDR_KEEPER_CONNECT_TIMEOUT` | `120` | seconds a keeper keeps trying to open its first connection to an actor |
 | `HERDR_KEEPER_WAKE_TIMEOUT` | `180` | seconds a keeper keeps trying to reconnect (wake) a parked actor before it gives up |
 | `HERDR_KEEPER_MAX_UNACKED` | `33554432` (32 MiB) | client input a keeper buffers unacknowledged before it gives up on the session |
@@ -1411,8 +1414,8 @@ fails in ways that look unrelated.
 | Path | Purpose |
 |---|---|
 | `actor/Dockerfile`, `actor/entrypoint.sh`, `actor/sshd_config`, `actor/herdr-config.toml` | the agent actor: Claude Code and a herdr server behind sshd behind websocat :80; pinned binaries; Claude onboarding pre-completed |
-| `hub/Dockerfile`, `hub/entrypoint.sh`, `hub/herdr-config.toml` | the hub image; generates its SSH key and ssh config on its volume, runs the idle bridge and the web terminal (ttyd); takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
-| `hub/herdr-web.js`, `hub/herdr-web-index` | the web terminal's copy, paste and right-click handling, and the script that adds it to ttyd's page when the hub starts |
+| `hub/Dockerfile`, `hub/entrypoint.sh` | the hub image; generates its SSH key, ssh config and herdr config on its volume, runs the idle bridge and the web terminal (ttyd); takes `kubectl-ate` from `hub/bin/linux-<arch>/` |
+| `hub/herdr-web.js`, `hub/herdr-web-index` | the web terminal's copy, paste and right-click handling, and the script that adds it to ttyd's page when the image is built |
 | `hub/ate-wss-proxy` | SSH ProxyCommand: mTLS WebSocket to atenet-router with the pod's SPIFFE certificate |
 | `hub/hubctl` | create/delete agents, add/remove machines, suspend/resume (parking keepers), idle bridge, `ate` passthrough |
 | `hub/herdr-keeper`, `hub/ssh` | keeps each machine connection looking online while its actor is suspended; the `ssh` wrapper hands herdr's bridges to it |
@@ -1459,7 +1462,7 @@ fails in ways that look unrelated.
 | Always-on: real herdr TUI attached; idle agent → keeper parked → actor suspended, machine stays enabled | same, suspend emulated with `docker pause` | pass |
 | Suspended: luna shows online for 45 s of health checks; nothing reaches the router; a resize doesn't wake it | same | pass |
 | A typed command wakes it: router resumes the actor, keeper rejoins the same session, output on screen | same | container up in 0.16 s, session resumed in 0.38 s |
-| Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor, a takeover mid-stream delivers every byte exactly once | `test/keeper-test.py` | 34/34 (forced park and close included), 30 runs in a row; the code before the review fixes fails the reconnect check about 1 run in 4 and the takeover check every run |
+| Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, forced park loses nothing, lost session reported, a clear error for images without the anchor, close ends the keeper, a takeover mid-stream delivers every byte exactly once | `test/keeper-test.py` | 32/32, 30 runs in a row; the code before the review fixes fails the reconnect check about 1 run in 4 and the takeover check every run |
 | Web terminal: ttyd in the hub listens on loopback only; headless Chromium types a command that runs on luna and shows in the tmux client too; closing the tab ends its herdr client; a new tab on a suspended luna wakes it | `test/hub-path-test.sh` steps 1, 10, 11 (31/31 in all) | pass |
 | Web terminal: a mouse selection reaches the clipboard, right-click opens herdr's menu with the browser's suppressed, `ctrl+v` pastes into luna. ttyd's own page does none of the three | same, step 12; the same checks against ttyd's default page | pass; default page fails all three |
 | `web`: forwards, checks the page answers, stops the port-forward on exit; reports a proxy-only hub (407) clearly | script run against a stub kubectl and ttyd | pass |
@@ -1498,7 +1501,7 @@ test/keeper-test.py
 ```
 
 The other two run against plain Docker, without a cluster. They need herdr 0.9.5, websocat 1.14 or newer,
-OpenSSH, openssl and tmux on your machine (`brew install herdr websocat tmux`), and use a throwaway `HOME`: your
+OpenSSH, openssl, tmux and jq on your machine (`brew install herdr websocat tmux jq`), and use a throwaway `HOME`: your
 own herdr machines and `~/.ssh` are untouched. The hub test drives a real herdr TUI in tmux, and emulates
 substrate's suspend with `docker pause`. Its last steps use the hub's web terminal from a headless Chromium, so it
 also needs ttyd and Node.js with Playwright (`brew install ttyd`, then `npm install -g playwright` and
@@ -1637,7 +1640,7 @@ the hub.
 | `deploy`: "no hub SSH key" | run `hub` (the key is kept on the hub's volume; `.state` is only a local copy) |
 | `herdr: cannot attach without a usable terminal: … zero-sized grid` | use `host/herdr-substrate.sh attach`, which sets the terminal size |
 | `error: unknown machine '<name>'` | the `machine <name>` step hasn't completed; run it |
-| `machine '<name>' is disabled` | disabled by hand, or by an older version of this kit. `herdr machine enable <id>` in the hub. `idle-watch` re-enables `ate-*` machines once, the first time the hub starts with this version; a machine you disable after that stays disabled |
+| `machine '<name>' is disabled` | disabled by hand, or by a version of this kit from before always-on machines. `herdr machine enable <id>` in the hub |
 | Claude Code: "Unable to connect to Anthropic services … platform.claude.com: ENOTFOUND" | actor built from an older image without pre-completed onboarding. In its pane: `python3 -c 'import json,os;p=os.path.expanduser("~/.claude.json");d=json.load(open(p)) if os.path.exists(p) else {};d["hasCompletedOnboarding"]=True;json.dump(d,open(p,"w"))'` |
 | `codex`: `401 Unauthorized` | `AGENTS` lacks `codex` (no egress rule or placeholder), or the OpenAI key is wrong. `verify <name>` shows which; changing `AGENTS` needs `down`, `hub`, `deploy` and new actors |
 | `codex`: "error sending request" / certificate errors | the gateway's CA isn't in the actor's system store (actor built before Codex support): rebuild with `image`, then `down` and `deploy` |
@@ -1650,14 +1653,14 @@ the hub.
 | An actor resumes right after being suspended | something connected through the router: input in a client (expected), or `verify`, `debug`, herdr's probes when a client starts. It is suspended again after `IDLE_SECONDS`; `logs` shows why it woke |
 | Keeper log: `the actor no longer has this session`, after a burst of output | the anchor ended the session at `HERDR_ANCHOR_MAX_UNACKED` (32 MiB) of unacknowledged output; herdr reconnects with a new session. The anchor's log in the actor says `dropping it` |
 | `logs`: `not suspending, keeper reported: busy` | someone typed while the keepers were parking; the next poll tries again |
-| `logs`: `not suspending, keeper reported: unsupported` | the actor's image has no `herdr-anchor` (built before it existed): it works, but can't be suspended under an attached client. Rebuild with `image`, then `down` and `deploy` to recreate the template |
+| herdr can't connect to a machine; its keeper log (`/tmp/herdr-keepers/<name>/*.log` in the hub) says "no herdr-anchor" | the actor's image predates `herdr-anchor`. Rebuild with `image`, then `down` and `deploy` to recreate the template |
 | A machine shows `reconnecting` after a long suspend | the resume took longer than `HERDR_KEEPER_WAKE_TIMEOUT` (180 s), or the actor lost its session (reverted, crashed, or the anchor's 15-minute cleanup ran). herdr reconnects by itself; the keeper log in the hub (`/tmp/herdr-keepers/<name>/`) says which |
 | `hubctl create`: "no egress policy at /etc/herdr-hub/policy/egress-policy.yaml" | the hub was deployed before `create` existed: re-run `hub`. Or pass `--policy FILE` |
 | `hubctl create`: `PermissionDenied` | the hub's access policy is missing; re-run `deploy` |
 | `web`: "this hub image has no web terminal" | the hub runs an image from before ttyd was added: `hub-image` (or a newer `HUB_IMAGE`), then `hub` |
 | `web`: "port-forward failed" | something else uses local port 7681: `WEB_PORT=7682 host/herdr-substrate.sh web` |
 | Web: selecting text doesn't copy, or says "The browser blocked the copy" | the page isn't on `localhost` or `https` (browsers only allow clipboard access there), or Safari refused. Use `web`'s `http://localhost` URL or the shared `https` link; Chrome and Edge allow it |
-| Web: the browser's menu still covers herdr's on right-click | the hub started without its page (`logs` shows "could not build the web page"), or runs an older image: `hub-image`, then `hub` |
+| Web: the browser's menu still covers herdr's on right-click | the hub runs an older image: `hub-image`, then `hub` |
 | The web page says "Press ⏎ to Reconnect" | the WebSocket dropped (laptop asleep, `web` stopped, proxy timeout). Restart `web` if needed and press Enter: a fresh herdr client starts, nothing on the hub or the actors is lost |
 | Agents get `503 upstream connect error … remote connection failure`; the gateway log (`kubectl -n ate-system logs deployment/atenet-egress -c envoy`) shows `Network_is_unreachable` to an IPv6 address | the egress gateway tries IPv6 and pods have no IPv6 route. Run `host/herdr-substrate.sh egress-dns` (`cluster` does it, but reinstalling substrate puts `ALL` back) |
 | zsh: a pasted command waits at `quote>` | it contained a `#` comment with an apostrophe; press Ctrl-C. `setopt interactive_comments` in `~/.zshrc` makes zsh accept comments |
@@ -1687,8 +1690,8 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   - **How:** a `herdr-keeper` in the hub answers herdr's health checks for a parked machine, and a `herdr-anchor`
     in the actor keeps the session alive across the suspend. Input wakes the actor.
   - **Idle detection:** idle means no working or blocked agent *and* no input, and only running actors are polled.
-  - **Older images:** actors without the anchor fall back to a plain relay and aren't suspended under an
-    attached client.
+  - **Older images:** actors without the anchor fell back to a plain relay and weren't suspended under an
+    attached client (removed later; see "Hub simplification").
 - **Actor code review fixes** (review doc: "Code review: herdr-substrate actor/"):
   - **Exactly-once replay.** Three races could duplicate, drop or reorder input across a reconnect: the anchor kept
     relaying an old connection after a takeover, the keeper processed data from a connection it had replaced, and
@@ -1732,3 +1735,15 @@ Fixes made while bringing the kit up on a real cluster, all included above:
     - The keeper's run directory is root-only at both levels.
     - `ate-wss-proxy` fails clearly without an identity bundle.
     - The hub image no longer installs tmux.
+- **Hub simplification** (about 250 lines fewer in `hub/`):
+  - **Parking without draining.** A keeper parks by dropping its connection at once; unacknowledged data is
+    replayed on the next wake, so the drain-and-wait park and its abort paths are gone. A park is refused only
+    after very recent input or output; `--force` skips that check.
+  - **No plain relay.** Actors from images without `herdr-anchor` are no longer supported; their keeper says to
+    rebuild the image. A bridge command herdr changed still gets plain herdr, through the real ssh.
+  - **`jq` in `hubctl`** instead of inline Python for the JSON. The one-time re-enable of machines disabled by
+    old versions is gone.
+  - **The web page is built into the image** instead of at every hub start; the copy fallback for insecure pages
+    and the "Copied" notice are gone.
+  - **Smaller image setup:** `COPY --chmod`, and the hub's herdr config is written by the entrypoint (no
+    `hub/herdr-config.toml`).

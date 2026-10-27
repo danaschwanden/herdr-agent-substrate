@@ -15,7 +15,7 @@ ARG TTYD_VERSION=1.7.7
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      openssh-client openssl ca-certificates curl tini python3 bash procps less \
+      openssh-client openssl ca-certificates curl tini python3 bash procps less jq \
  && rm -rf /var/lib/apt/lists/*
 
 # Same pinned herdr and websocat as actor/Dockerfile: the hub's herdr must
@@ -44,20 +44,21 @@ RUN set -eu; \
     echo "${ttyd_sha}  /usr/local/bin/ttyd" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/herdr /usr/local/bin/websocat /usr/local/bin/ttyd
 
-COPY bin/linux-${TARGETARCH}/kubectl-ate /usr/local/bin/kubectl-ate
+# The web terminal's page: ttyd's own, from this ttyd, plus herdr-web.js
+# (copy, right-click and paste fixes). Built once here, served with ttyd -I.
+COPY --chmod=0755 herdr-web-index herdr-web.js /tmp/web/
+RUN mkdir -p /usr/local/share/herdr-hub \
+ && /tmp/web/herdr-web-index /tmp/web/herdr-web.js /usr/local/share/herdr-hub/index.html \
+ && rm -rf /tmp/web
+
+COPY --chmod=0755 bin/linux-${TARGETARCH}/kubectl-ate ate-wss-proxy hubctl herdr-keeper /usr/local/bin/
 # Shared with the actor image (named build context "common", the kit's common/):
 # the keeper <-> anchor protocol and the entrypoints' log/supervise helpers.
 COPY --from=common herdr_wire.py service.sh /usr/local/lib/herdr-substrate/
-COPY ate-wss-proxy hubctl herdr-keeper herdr-web-index /usr/local/bin/
-COPY herdr-web.js /usr/local/share/herdr-hub/herdr-web.js
 # herdr runs `ssh` from PATH; this wrapper hands ate-* client bridges to
 # herdr-keeper and everything else to /usr/bin/ssh.
-COPY ssh /usr/local/lib/herdr-hub/bin/ssh
-COPY entrypoint.sh /usr/local/bin/herdr-hub-entrypoint
-COPY herdr-config.toml /etc/herdr-hub/herdr-config.toml
-RUN chmod 0755 /usr/local/bin/herdr-keeper /usr/local/bin/herdr-web-index /usr/local/lib/herdr-hub/bin/ssh \
- && chmod 0755 /usr/local/bin/kubectl-ate /usr/local/bin/ate-wss-proxy \
-      /usr/local/bin/hubctl /usr/local/bin/herdr-hub-entrypoint
+COPY --chmod=0755 ssh /usr/local/lib/herdr-hub/bin/ssh
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/herdr-hub-entrypoint
 
 # HOME is the persistent volume (see manifests/hub.yaml.tmpl). Root's passwd
 # entry points there too: OpenSSH resolves ~ from the password database, not

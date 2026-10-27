@@ -16,7 +16,7 @@
 # suspended, and input wakes it. Last, a headless Chromium uses the hub's web
 # terminal (ttyd) as a second client.
 #
-# Needs: docker, herdr, websocat, ttyd, ssh, openssl, tmux, python3 with
+# Needs: docker, herdr, websocat, ttyd, ssh, openssl, tmux, jq, python3 with
 # `websockets`, node with `playwright` (and its Chromium), and
 # atenet-router.ate-system.svc resolving to 127.0.0.1 (add it to /etc/hosts).
 # Usage: test/hub-path-test.sh [ACTOR_IMAGE]
@@ -57,7 +57,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for c in docker herdr websocat ttyd ssh openssl python3 setsid tmux node; do
+for c in docker herdr websocat ttyd ssh openssl jq python3 setsid tmux node; do
   command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
 done
 python3 -c 'import websockets' 2>/dev/null || { echo "pip install websockets" >&2; exit 1; }
@@ -128,8 +128,10 @@ export DOCKER_CONFIG="${DOCKER_CONFIG:-${HOME}/.docker}"
 export HOME="${WORK}/hub-home"; mkdir -p "${HOME}"
 export ATE_IDENTITY_BUNDLE="${pki}/hub.bundle.pem" ATE_ROUTER_CA="${pki}/servicedns.crt" \
        ATE_API_TOKEN="${WORK}/token" ATE_ROUTER_URL="wss://${ROUTER_HOST}:${ROUTER_PORT}/" \
-       HUB_SHARE="${KIT_DIR}/hub" IDLE_SECONDS=15 POLL_SECONDS=3 \
+       IDLE_SECONDS=15 POLL_SECONDS=3 HUB_WEB_INDEX="${WORK}/web-index.html" \
        HERDR_KEEPER_RUN="${WORK}/keepers" HUB_WEB_PORT="${WEB_PORT:-7699}"
+# The image builds the web page at build time; here, the same script does it.
+herdr-web-index "${KIT_DIR}/hub/herdr-web.js" "${HUB_WEB_INDEX}"
 
 step "1. hub starts and generates its SSH key"
 setsid bash "${KIT_DIR}/hub/entrypoint.sh" >"${WORK}/hub.log" 2>&1 &

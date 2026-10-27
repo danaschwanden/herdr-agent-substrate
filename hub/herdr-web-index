@@ -1,21 +1,13 @@
 #!/usr/bin/env bash
-# herdr-web-index OUT: write ttyd's own page with hub/herdr-web.js added, for
-# `ttyd --index OUT`. The page comes from this very ttyd binary (started for a
+# herdr-web-index JS OUT: write ttyd's own page with the script JS
+# (hub/herdr-web.js) added, for `ttyd --index OUT`. Run once at image build
+# (hub/Dockerfile). The page comes from the ttyd binary on PATH (started for a
 # moment on a private Unix socket), so it always matches ttyd's version.
-#
-#   HERDR_WEB_JS  the script to inject (default: next to this file, or
-#                 /usr/local/share/herdr-hub/herdr-web.js)
 set -euo pipefail
 
-out="${1:?usage: herdr-web-index OUT}"
-here="$(cd "$(dirname "$0")" && pwd)"
-js="${HERDR_WEB_JS:-}"
-if [[ -z "${js}" ]]; then
-  for c in "${here}/herdr-web.js" /usr/local/share/herdr-hub/herdr-web.js; do
-    [[ -f "${c}" ]] && { js="${c}"; break; }
-  done
-fi
-[[ -f "${js}" ]] || { echo "herdr-web-index: herdr-web.js not found" >&2; exit 1; }
+js="${1:?usage: herdr-web-index JS OUT}"
+out="${2:?usage: herdr-web-index JS OUT}"
+[[ -f "${js}" ]] || { echo "herdr-web-index: ${js} not found" >&2; exit 1; }
 
 # A short path: Unix socket paths are limited to about 100 bytes.
 tmp="$(mktemp -d /tmp/herdr-web.XXXXXX)"

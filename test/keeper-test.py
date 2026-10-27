@@ -244,7 +244,8 @@ async def main():
         check(pings == 1, "server saw the ping", f"(pings={pings})")
 
         print("\n\033[1m3. park, then suspend the actor\033[0m")
-        reply = keeper_call(run, {"cmd": "park", "timeout": 10})
+        await asyncio.sleep(2.2)               # no input for a moment: not in use
+        reply = keeper_call(run, {"cmd": "park"})
         check(reply.get("result") == "parked", "keeper parked", str(reply))
         os.kill(anchor.pid, signal.SIGSTOP)
         st = keeper_call(run, {"cmd": "status"})
@@ -311,7 +312,7 @@ async def main():
                 await asyncio.sleep(0.1)
         typer = asyncio.create_task(typing())
         await asyncio.sleep(0.2)
-        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park", "timeout": 10})
+        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park"})
         await typer
         for _ in range(30):
             await client.recv(timeout=20)
@@ -322,12 +323,11 @@ async def main():
         typed = [bytes([13]) + b"f%02d" % i for i in range(20)]
         for p in typed:
             await client.send(p)
-        # Output still flowing: a clean park can't finish in 0.3 s.
-        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park", "timeout": 0.3})
-        check(reply.get("result") == "busy", "clean park refused while output flows", str(reply))
+        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park"})
+        check(reply.get("result") == "busy", "park without force refused right after input", str(reply))
         for p in typed:
             await client.send(p)
-        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park", "force": True, "timeout": 0.3})
+        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park", "force": True})
         check(reply.get("result") == "parked", "forced park parks", str(reply))
         typed = typed + typed
         os.kill(anchor.pid, signal.SIGSTOP)
@@ -351,7 +351,7 @@ async def main():
               "every keystroke arrives once, in order, after the next wake", str(echoes[:3]))
 
         print("\n\033[1m8. the actor lost the session (restart, revert): the client is told\033[0m")
-        reply = keeper_call(run, {"cmd": "park", "timeout": 10})
+        reply = keeper_call(run, {"cmd": "park", "force": True})
         anchor.kill()
         anchor.wait()
         anchor = start_anchor()
@@ -364,46 +364,35 @@ async def main():
         rc = await asyncio.wait_for(keeper.wait(), 10)
         check(rc == 255, "keeper exited 255, like a failed ssh", f"(rc={rc})")
 
-        print("\n\033[1m9. an actor from an older image (no herdr-anchor): plain relay\033[0m")
+        print("\n\033[1m9. an actor from an older image (no herdr-anchor): a clear error\033[0m")
         old_ssh = os.path.join(work, "ssh-old")
-        open(old_ssh, "w").write(
-            "#!/usr/bin/env python3\n"
-            "import os, sys\n"
-            "cmd = sys.argv[-1]\n"
-            "if 'herdr-anchor' in cmd: sys.exit(97)\n"
-            "os.execvp('/bin/sh', ['sh', '-c', cmd])\n")
+        open(old_ssh, "w").write("#!/bin/sh\nexit 97\n")    # what ANCHOR_COMMAND does there
         os.chmod(old_ssh, 0o755)
         old = await asyncio.create_subprocess_exec(
             sys.executable, f"{KIT}/hub/herdr-keeper", "--target", "ate-luna", "--command", cmd,
-            "--", "-T", "ate-luna", cmd,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, env={**env, "HERDR_REAL_SSH": old_ssh,
                                                  "HERDR_KEEPER_RUN": run + "-old"})
-        oc = Client(old)
-        check(await oc.preamble(), "ready marker delivered")
-        await oc.send(bytes([13]) + b"legacy")
-        r = await oc.recv()
-        check(r.endswith(b"\x0dlegacy"), "frames relayed to the server")
-        await oc.send(control(PING, b"p9"))
-        check(await oc.recv() == control(PONG, b"p9"), "pings answered by the real server")
-        import glob
-        sock_path = glob.glob(os.path.join(run + "-old", "luna", "*.sock"))[0]
-        s2 = socket.socket(socket.AF_UNIX)
-        s2.settimeout(10)
-        s2.connect(sock_path)
-        s2.sendall(b'{"cmd":"park","timeout":5}\n')
-        reply = json.loads(s2.recv(65536))
-        check(reply.get("result") == "unsupported", "park refused, so hubctl won't suspend it", str(reply))
-        s2.close()
+        await asyncio.wait_for(old.wait(), 30)         # stdin stays open, as herdr keeps it
+        err = await old.stderr.read()
+        check(old.returncode == 255 and b"no herdr-anchor" in err,
+              "keeper exits 255 and says to rebuild the image", f"(rc={old.returncode}, {err!r})")
 
         print("\n\033[1m9b. close (hubctl remove/delete): the keeper exits and doesn't reconnect\033[0m")
+        closing = await asyncio.create_subprocess_exec(
+            sys.executable, f"{KIT}/hub/herdr-keeper", "--target", "ate-luna", "--command", cmd,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env={**env, "HERDR_KEEPER_RUN": run + "-close"})
+        check(await Client(closing).preamble(), "a new keeper connects")
+        import glob
+        sock_path = glob.glob(os.path.join(run + "-close", "luna", "*.sock"))[0]
         s3 = socket.socket(socket.AF_UNIX)
         s3.settimeout(10)
         s3.connect(sock_path)
         s3.sendall(b'{"cmd":"close"}\n')
         reply = json.loads(s3.recv(65536))
         check(reply.get("result") == "closed", "close acknowledged", str(reply))
-        rc = await asyncio.wait_for(old.wait(), 10)
+        rc = await asyncio.wait_for(closing.wait(), 10)
         check(rc == 0, "keeper exited 0", f"(rc={rc})")
         check(not os.path.exists(sock_path), "its control socket is gone")
 

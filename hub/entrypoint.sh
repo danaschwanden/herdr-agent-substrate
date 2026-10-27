@@ -48,9 +48,11 @@ Host ate-*
 EOF
 chmod 0600 "${HOME}/.ssh/config"
 
-HUB_SHARE="${HUB_SHARE:-/etc/herdr-hub}"
-if [[ ! -f "${HOME}/.config/herdr/config.toml" && -f "${HUB_SHARE}/herdr-config.toml" ]]; then
-  cp "${HUB_SHARE}/herdr-config.toml" "${HOME}/.config/herdr/config.toml"
+# herdr's config, seeded once (edit it on the volume afterwards). The hub's
+# herdr must match the actors' (both pinned in the images), so release checks
+# are off: upgrade by rebuilding both images together.
+if [[ ! -f "${HOME}/.config/herdr/config.toml" ]]; then
+  printf '[update]\nversion_check = false\n' >"${HOME}/.config/herdr/config.toml"
 fi
 
 for f in "${ATE_IDENTITY_BUNDLE:-/var/run/ate/identity/credential-bundle.pem}" \
@@ -76,18 +78,20 @@ fi
 #   HUB_WEB_PORT         default 7681
 #   HUB_WEB_AUTH_HEADER  optional; refuse requests without this header, which
 #                        an authenticating proxy sets (e.g. X-Forwarded-Email)
+#   HUB_WEB_INDEX        the page ttyd serves: its own plus hub/herdr-web.js,
+#                        built into the image by hub/herdr-web-index
 HUB_WEB="${HUB_WEB:-true}"
 HUB_WEB_ADDR="${HUB_WEB_ADDR:-127.0.0.1}"
 HUB_WEB_PORT="${HUB_WEB_PORT:-7681}"
 if [[ "${HUB_WEB}" != "true" ]]; then
   log "web terminal disabled (HUB_WEB=${HUB_WEB})"
-elif ! command -v ttyd >/dev/null; then
-  log "WARNING: ttyd is not in this image; the web terminal is unavailable"
 else
   # -W: tabs may type (ttyd is read-only otherwise); -O: refuse WebSockets
   # from other origins; the page title stays "herdr"; closing a tab only
-  # detaches that client, so no "leave this page?" prompt.
+  # detaches that client, so no "leave this page?" prompt. -I: the page with
+  # herdr's copy (OSC 52), right-click menu and ctrl+v paste fixed.
   web_args=(-p "${HUB_WEB_PORT}" -W -O -w "${HOME}"
+            -I "${HUB_WEB_INDEX:-/usr/local/share/herdr-hub/index.html}"
             -t titleFixed=herdr -t disableLeaveAlert=true)
   [[ "${HUB_WEB_ADDR}" == "0.0.0.0" ]] || web_args+=(-i "${HUB_WEB_ADDR}")
   [[ -z "${HUB_WEB_AUTH_HEADER:-}" ]] || web_args+=(-H "${HUB_WEB_AUTH_HEADER}")
@@ -96,16 +100,6 @@ else
         && "${HUB_WEB_ADDR}" != ::1 && -z "${HUB_WEB_AUTH_HEADER:-}" ]]; then
     log "WARNING: the web terminal listens on ${HUB_WEB_ADDR} without HUB_WEB_AUTH_HEADER;" \
         "anyone who reaches that address gets a shell unless a sign-in proxy (IAP, oauth2-proxy) is the only way in"
-  fi
-  # ttyd's page plus hub/herdr-web.js: herdr's copy (OSC 52) reaches the
-  # browser's clipboard, its right-click menu isn't covered by the browser's,
-  # and ctrl+v pastes.
-  web_index="${HOME}/.herdr-hub/web-index.html"
-  mkdir -p "${HOME}/.herdr-hub"
-  if herdr-web-index "${web_index}"; then
-    web_args+=(-I "${web_index}")
-  else
-    log "WARNING: could not build the web page; serving ttyd's default (no copy or right-click fixes)"
   fi
   supervise web ttyd "${web_args[@]}" herdr &
   log "web terminal on ${HUB_WEB_ADDR}:${HUB_WEB_PORT}"

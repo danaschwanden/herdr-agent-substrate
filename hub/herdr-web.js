@@ -8,45 +8,11 @@
   'use strict';
   var isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 
-  function toast(text) {
-    var el = document.getElementById('herdr-toast');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'herdr-toast';
-      el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:10;padding:6px 10px;' +
-        'border-radius:6px;background:rgba(40,40,40,.92);color:#eee;' +
-        'font:13px/1.4 system-ui,sans-serif;pointer-events:none;transition:opacity .2s;opacity:0';
-      document.body.appendChild(el);
-    }
-    el.textContent = text;
-    el.style.opacity = '1';
-    clearTimeout(el._t);
-    el._t = setTimeout(function () { el.style.opacity = '0'; }, 1200);
-  }
-
-  // Fallback for browsers without the async clipboard API: needs a recent
-  // user gesture, which a selection drag just was.
-  function copyFallback(text) {
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
-    document.body.appendChild(ta);
-    ta.select();
-    var ok = false;
-    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
-    document.body.removeChild(ta);
-    if (window.term) window.term.focus();
-    return ok;
-  }
-
+  // The page is only ever served from localhost (port-forward) or over HTTPS
+  // (behind the sign-in proxy), so the async clipboard API is there.
   function copy(text) {
-    var done = function () { toast('Copied'); };
-    var fail = function () { toast(copyFallback(text) ? 'Copied' : 'The browser blocked the copy'); };
-    if (navigator.clipboard && window.isSecureContext) {
-      navigator.clipboard.writeText(text).then(done, fail);
-    } else {
-      fail();
-    }
+    if (!navigator.clipboard) return;
+    navigator.clipboard.writeText(text).catch(function (e) { console.warn('herdr: copy failed', e); });
   }
 
   // OSC 52: "<targets>;<base64>". "?" asks to read the clipboard; a browser

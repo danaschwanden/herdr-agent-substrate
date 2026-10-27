@@ -1,7 +1,8 @@
 # Builds the kit's two images for linux/amd64 and linux/arm64 and publishes them
 # to GitHub Container Registry:
 #
-#   ghcr.io/<owner>/herdr-actor   the agent: herdr server + Claude Code
+#   ghcr.io/<owner>/herdr-actor   the agent: herdr server + Claude Code, Codex
+#                                 and the Antigravity CLI (agy)
 #   ghcr.io/<owner>/herdr-hub     the herdr client + hubctl, one build per
 #                                 substrate release (its kubectl-ate must match
 #                                 the cluster's substrate)
@@ -15,6 +16,9 @@
 #   CLAUDE_CODE_VERSION  Claude Code release baked into herdr-actor. Unset: the
 #                        latest release at build time, recorded in the image's
 #                        labels and in the run summary.
+#   CODEX_VERSION        Codex release baked into herdr-actor, likewise.
+#                        (agy has no version pin: each build takes Google's
+#                        current release.)
 #   SUBSTRATE_REFS       comma-separated substrate tags or commits to build
 #                        herdr-hub for. Unset: v0.6.0.
 #
@@ -34,6 +38,10 @@ on:
     inputs:
       claude_code_version:
         description: Claude Code release for herdr-actor (empty uses CLAUDE_CODE_VERSION, then the latest)
+        required: false
+        default: ""
+      codex_version:
+        description: Codex release for herdr-actor (empty uses CODEX_VERSION, then the latest)
         required: false
         default: ""
       substrate_refs:
@@ -60,12 +68,15 @@ jobs:
       owner: ${{ steps.plan.outputs.owner }}
       push: ${{ steps.plan.outputs.push }}
       claude_code_version: ${{ steps.plan.outputs.claude_code_version }}
+      codex_version: ${{ steps.plan.outputs.codex_version }}
       substrate_refs: ${{ steps.plan.outputs.substrate_refs }}
     steps:
       - id: plan
         env:
           INPUT_CLAUDE: ${{ inputs.claude_code_version }}
           VAR_CLAUDE: ${{ vars.CLAUDE_CODE_VERSION }}
+          INPUT_CODEX: ${{ inputs.codex_version }}
+          VAR_CODEX: ${{ vars.CODEX_VERSION }}
           INPUT_REFS: ${{ inputs.substrate_refs }}
           VAR_REFS: ${{ vars.SUBSTRATE_REFS }}
           EVENT: ${{ github.event_name }}
@@ -83,6 +94,12 @@ jobs:
           fi
           [[ "${claude}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "bad Claude Code version: ${claude}" >&2; exit 1; }
           echo "claude_code_version=${claude}" >>"$GITHUB_OUTPUT"
+          codex="${INPUT_CODEX:-${VAR_CODEX:-}}"
+          if [[ -z "${codex}" ]]; then
+            codex="$(npm view @openai/codex version)"
+          fi
+          [[ "${codex}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "bad Codex version: ${codex}" >&2; exit 1; }
+          echo "codex_version=${codex}" >>"$GITHUB_OUTPUT"
           refs="${INPUT_REFS:-${VAR_REFS:-v0.6.0}}"
           python3 - "${refs}" >>"$GITHUB_OUTPUT" <<'PY'
           import json, re, sys
@@ -95,6 +112,7 @@ jobs:
           {
             echo "### Plan"
             echo "- Claude Code: \`${claude}\`"
+            echo "- Codex: \`${codex}\`"
             echo "- herdr-hub for substrate: \`${refs}\`"
             echo "- push: $([[ "${EVENT}" == pull_request ]] && echo no || echo yes)"
           } >>"$GITHUB_STEP_SUMMARY"
@@ -137,8 +155,9 @@ jobs:
             type=ref,event=pr
           labels: |
             org.opencontainers.image.title=herdr-actor
-            org.opencontainers.image.description=herdr server and Claude Code for an agent-substrate actor
+            org.opencontainers.image.description=herdr server with Claude Code, Codex and agy for an agent-substrate actor
             dev.herdr-substrate.claude-code.version=${{ needs.plan.outputs.claude_code_version }}
+            dev.herdr-substrate.codex.version=${{ needs.plan.outputs.codex_version }}
 
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -147,6 +166,7 @@ jobs:
           platforms: ${{ env.PLATFORMS }}
           build-args: |
             CLAUDE_CODE_VERSION=${{ needs.plan.outputs.claude_code_version }}
+            CODEX_VERSION=${{ needs.plan.outputs.codex_version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           push: ${{ needs.plan.outputs.push == 'true' }}

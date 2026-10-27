@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# agent-setup: point each agent CLI at the placeholder credential that the
+# ActorTemplate puts in the environment. The real credentials never enter the
+# actor: substrate's egress gateway swaps them in on the way out.
+#
+#   Claude Code  ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN: read directly
+#   Codex        OPENAI_API_KEY: Codex reads keys only from its login, so the
+#                placeholder is stored with `codex login --with-api-key`
+#   agy          GEMINI_API_KEY: read only with modelProvider "gemini" in
+#                ~/.gemini/antigravity-cli/settings.json
+#
+# Runs at boot (entrypoint), i.e. while substrate builds the golden snapshot.
+# Idempotent; leaves existing settings alone.
+set -euo pipefail
+log() { printf '[agent-setup] %s\n' "$*" >&2; }
+
+if [[ -n "${OPENAI_API_KEY:-}" ]] && command -v codex >/dev/null; then
+  if [[ ! -s "${HOME}/.codex/auth.json" ]]; then
+    if printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null 2>&1; then
+      log "codex: signed in with the placeholder key"
+    else
+      log "WARNING: codex login --with-api-key failed"
+    fi
+  fi
+fi
+
+if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+  settings="${HOME}/.gemini/antigravity-cli/settings.json"
+  mkdir -p "$(dirname "${settings}")"
+  python3 - "${settings}" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+data = json.load(open(path)) if os.path.exists(path) else {}
+data.setdefault("modelProvider", "gemini")
+json.dump(data, open(path, "w"), indent=2)
+PY
+  log "agy: modelProvider $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["modelProvider"])' "${settings}")"
+fi

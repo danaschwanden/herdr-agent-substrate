@@ -32,6 +32,21 @@ for d in /tmp /var/tmp; do
   chmod 1777 "${d}" 2>/dev/null || log "WARNING: could not set mode 1777 on ${d}"
 done
 
+# --- the egress gateway's CA, system-wide -------------------------------------
+# The gateway terminates TLS to inject credentials. Node tools (Claude Code)
+# trust its CA through NODE_EXTRA_CA_CERTS; native ones (Codex, agy, git, curl)
+# read the system store, so add it there too.
+mitm_ca=/run/ate/trust-bundle.pem
+if [[ -s "${mitm_ca}" ]]; then
+  mkdir -p /usr/local/share/ca-certificates
+  cp "${mitm_ca}" /usr/local/share/ca-certificates/ate-egress-mitm.crt
+  update-ca-certificates >/dev/null 2>&1 || log "WARNING: could not add the egress CA to the system store"
+fi
+
+# --- agent CLIs ----------------------------------------------------------------
+# Codex and agy need their placeholder credentials in their own config files.
+agent-setup || log "WARNING: agent-setup failed; Codex or agy may ask you to sign in"
+
 # --- SSH host key and authorized keys -------------------------------------
 # The host key is generated on first boot, i.e. while substrate builds the
 # template's golden snapshot. Every actor cloned from that snapshot therefore

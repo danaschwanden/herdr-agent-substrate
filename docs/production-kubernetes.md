@@ -109,7 +109,7 @@ flowchart LR
 | **Three kinds of nodes** | general (hub, cluster add-ons), control plane (substrate's services), agents (workers). One node can't be two kinds |
 | **A default StorageClass** | The hub's 1 GiB volume |
 | **Secrets encrypted at rest** (`--encryption-provider-config`, ideally KMS v2) | The Anthropic key, database DSNs and S3 credential are Kubernetes Secrets |
-| **Outbound HTTPS to `api.anthropic.com`** from the control-plane nodes | The egress gateway runs there |
+| **Outbound HTTPS to `api.anthropic.com`** from the control-plane nodes, and to `api.openai.com` and `generativelanguage.googleapis.com` for Codex and agy | The egress gateway runs there |
 | **An S3-compatible object store** (AWS S3, MinIO, Ceph RGW, …) | Snapshots |
 | **PostgreSQL 15 or later, highly available** | ate-api's store. The bundled single-pod database is for development |
 | **A container registry your nodes can pull from** | Substrate's and the kit's images |
@@ -644,6 +644,7 @@ WORKER_NODE_SELECTOR='{"ate.dev/sandboxClass": "gvisor"}'
 WORKER_REPLICAS=3
 IDLE_SECONDS=900
 CLAUDE_AUTH=${CLAUDE_AUTH:-api-key}
+AGENTS=${AGENTS:-claude}
 ATE_CLIENT_SERVICE_ACCOUNT=herdr-operator
 EOF
 cat "$KIT_DIR/.env"
@@ -773,6 +774,27 @@ unset CLAUDE_CODE_OAUTH_TOKEN
 
 `hub` installs the matching default policy for `hubctl create`. To rotate the token, run the block again with a
 new one; the actors hold only a placeholder.
+
+**Codex and agy.** To give actors Codex or the Antigravity CLI ([Agents](../README.md#agents)), list them in
+`AGENTS` and supply their API keys. `deploy` stores them in Secrets `openai` and `gemini` next to the Anthropic
+one:
+
+```bash
+cd "$KIT_DIR"
+sed -i.bak 's/^AGENTS=.*/AGENTS=claude,codex,agy/' .env
+grep '^AGENTS' .env
+printf 'Anthropic API key: '; read -rs ANTHROPIC_API_KEY; printf '\n'
+printf 'OpenAI API key: '; read -rs OPENAI_API_KEY; printf '\n'
+printf 'Gemini API key: '; read -rs GEMINI_API_KEY; printf '\n'
+export ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY
+host/herdr-substrate.sh hub
+host/herdr-substrate.sh deploy
+unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY
+```
+
+With a subscription token, read `CLAUDE_CODE_OAUTH_TOKEN` instead of the Anthropic key. Leave out what you don't
+use, in both `AGENTS` and the prompts. `deploy` keeps an existing template, so on a cluster that already has one,
+run `down` first and recreate the actors.
 
 Now scope the provider's access (step 11's last block), then create and use agents:
 
@@ -1309,7 +1331,7 @@ Start with the [kit's troubleshooting chain](../README.md#troubleshooting). Upst
 | WorkerPool pods `Pending` | Agent nodes missing the `ate.dev/sandboxClass=gvisor` label, or not enough room for 3 GiB workers |
 | Control-plane pods `Pending` | No nodes labeled `ate.dev/workloadType=ate-control-plane`, or too few for the replicas |
 | `verify`: HTTP 403 | The provider's namespace policy lacks `herdr-agents`, or step 11 scoped the provider before `herdr-agents-secrets` existed; re-run that block |
-| `verify` times out | Control-plane nodes can't reach `api.anthropic.com` (egress firewall or proxy) |
+| `verify` times out | Control-plane nodes can't reach `api.anthropic.com`, `api.openai.com` or `generativelanguage.googleapis.com` (egress firewall or proxy) |
 | Hub can't reach anything after step 11 | Cluster DNS labels differ from `k8s-app=kube-dns`, or the API server's addresses changed; adjust and re-run the block |
 | `kubectl ate`: `unknown service` / `Unimplemented` | kubectl-ate built from another substrate commit; rebuild from `$SUBSTRATE_DIR` (and `hub-image`) |
 | Shared link: `502` or `upstream connect error` after sign-in | The proxy can't reach ttyd: `HUB_WEB_ADDR=0.0.0.0` not applied (re-run `hub`), the `herdr-hub-web` Service or policy is missing, or the proxy's policy lacks the hub. `kubectl -n herdr-web logs deploy/herdr-web-auth` |

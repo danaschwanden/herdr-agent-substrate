@@ -1,0 +1,16 @@
+# Egress rule for Codex (AGENTS includes codex), added to each actor's policy.
+#
+# Codex signs in with an API key (agent-setup stores the placeholder with
+# `codex login --with-api-key`) and sends it as "Authorization: Bearer ...".
+# The gateway replaces that header with "Bearer " and the real key from
+# ${OPENAI_CREDENTIAL_URI}. Only api.openai.com: Codex also asks chatgpt.com
+# for its model list and plugins, which stays blocked (it falls back), so the
+# key never goes there.
+rules:
+- https:
+    hostnames: ["api.openai.com"]
+    effects:
+      replaceHeaders:
+      - header: authorization
+        prefix: "Bearer "
+        credentialUri: ${OPENAI_CREDENTIAL_URI}

@@ -1,0 +1,8 @@
+
+# --- herdr-substrate ---------------------------------------------------------
+# The actor is already the sandbox: gVisor, with default-deny egress. Codex's
+# own Linux sandbox (Landlock and seccomp) isn't available inside gVisor, so
+# commands would fail under it; run them directly, as Claude Code does.
+sandbox_mode = "danger-full-access"
+# Updates come from rebuilding the image; the actor can't reach the release feed.
+check_for_update_on_startup = false

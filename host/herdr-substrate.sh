@@ -42,6 +42,9 @@ PLATFORM="${PLATFORM:-}"
 # Claude Code release baked into the actor image; empty means the Dockerfile's
 # default (latest). Pin it for production.
 CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-}"
+# Codex release baked into the actor image; empty means latest. (agy has no
+# version pin: its installer takes Google's current release.)
+CODEX_VERSION="${CODEX_VERSION:-}"
 # Digest-pinned ateworker-gvisor image. Empty: borrow it from the counter demo,
 # as `cluster` sets up on kind.
 WORKER_IMAGE="${WORKER_IMAGE:-}"
@@ -77,6 +80,21 @@ case "${CLAUDE_AUTH}" in
   *) printf 'error: CLAUDE_AUTH must be api-key or oauth-token, got %s\n' "${CLAUDE_AUTH}" >&2; exit 1 ;;
 esac
 CREDENTIAL_URI="${CREDENTIAL_URI:-ate-secret://k8s.io/default/${SECRETS_NAMESPACE}/anthropic/${CREDENTIAL_KEY}}"
+# Which agent CLIs get credentials, comma-separated. The actor image always has
+# all three; each one listed here gets a placeholder in the template and an
+# egress rule that injects its real key:
+#   claude  Claude Code  -> api.anthropic.com (CLAUDE_AUTH decides how)
+#   codex   Codex        -> api.openai.com, OPENAI_API_KEY as Authorization: Bearer
+#   agy     Antigravity  -> generativelanguage.googleapis.com, GEMINI_API_KEY as x-goog-api-key
+AGENTS="${AGENTS:-claude}"
+OPENAI_CREDENTIAL_URI="${OPENAI_CREDENTIAL_URI:-ate-secret://k8s.io/default/${SECRETS_NAMESPACE}/openai/api-key}"
+GEMINI_CREDENTIAL_URI="${GEMINI_CREDENTIAL_URI:-ate-secret://k8s.io/default/${SECRETS_NAMESPACE}/gemini/api-key}"
+IFS=',' read -r -a AGENT_LIST <<<"${AGENTS// /}"
+for a in "${AGENT_LIST[@]}"; do
+  case "${a}" in claude|codex|agy) ;; *) printf 'error: AGENTS may list claude, codex and agy, got %s\n' "${a}" >&2; exit 1 ;; esac
+done
+(( ${#AGENT_LIST[@]} > 0 )) || { printf 'error: AGENTS is empty\n' >&2; exit 1; }
+agent_enabled() { [[ ",${AGENTS// /}," == *",$1,"* ]]; }
 STATE_DIR="${KIT_DIR}/.state"
 mkdir -p "${STATE_DIR}"
 
@@ -235,6 +253,7 @@ build_push() {
   meta="${STATE_DIR}/${name}-meta.json"
   args=(--platform "${platform}" --build-arg "HERDR_VERSION=${HERDR_VERSION}")
   [[ -n "${CLAUDE_CODE_VERSION}" ]] && args+=(--build-arg "CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION}")
+  [[ -n "${CODEX_VERSION}" ]] && args+=(--build-arg "CODEX_VERSION=${CODEX_VERSION}")
   log "building ${tag} for ${platform} and pushing it to ${REGISTRY}"
   docker buildx build "${args[@]}" -t "${tag}" --push --metadata-file "${meta}" "${dir}"
   # BuildKit records the digest when it pushes; when the Docker engine pushes
@@ -325,9 +344,43 @@ cmd_hub_image() {
 # CLAUDE_AUTH calls for. Used by `actor` and, through the ConfigMap `hub`
 # writes, by `hubctl create`.
 render_egress_policy() {
-  local tmpl="${KIT_DIR}/manifests/egress-policy.yaml.tmpl"
-  [[ "${CLAUDE_AUTH}" == oauth-token ]] && tmpl="${KIT_DIR}/manifests/egress-policy-oauth-token.yaml.tmpl"
-  ATESPACE="${ATESPACE}" CREDENTIAL_URI="${CREDENTIAL_URI}" render "${tmpl}" >"$1"
+  local parts=() tmpl
+  if agent_enabled claude; then
+    tmpl="${KIT_DIR}/manifests/egress-policy.yaml.tmpl"
+    [[ "${CLAUDE_AUTH}" == oauth-token ]] && tmpl="${KIT_DIR}/manifests/egress-policy-oauth-token.yaml.tmpl"
+    parts+=("${tmpl}")
+  fi
+  agent_enabled codex && parts+=("${KIT_DIR}/manifests/egress-rule-codex.yaml.tmpl")
+  agent_enabled agy && parts+=("${KIT_DIR}/manifests/egress-rule-agy.yaml.tmpl")
+  # One policy per actor: the first file whole, then only the rules of the rest.
+  local first=1 part
+  for part in "${parts[@]}"; do
+    ATESPACE="${ATESPACE}" CREDENTIAL_URI="${CREDENTIAL_URI}" \
+      OPENAI_CREDENTIAL_URI="${OPENAI_CREDENTIAL_URI}" GEMINI_CREDENTIAL_URI="${GEMINI_CREDENTIAL_URI}" \
+      render "${part}" | if (( first )); then cat; else sed -n '/^rules:/,$p' | tail -n +2; fi
+    first=0
+  done >"$1"
+}
+
+# The template's placeholder credentials, as YAML env entries (6 spaces deep).
+agent_env_yaml() {
+  local out=""
+  if agent_enabled claude; then
+    out+="  - name: ${CLAUDE_AUTH_ENV}"$'\n'"    value: \"${CLAUDE_AUTH_PLACEHOLDER}\""$'\n'
+  fi
+  if agent_enabled codex; then
+    out+="  - name: OPENAI_API_KEY"$'\n'"    value: \"sk-placeholder-replaced-by-egress-gateway\""$'\n'
+  fi
+  if agent_enabled agy; then
+    out+="  - name: GEMINI_API_KEY"$'\n'"    value: \"placeholder-replaced-by-egress-gateway\""$'\n'
+  fi
+  printf '%s' "${out%$'\n'}"
+}
+
+# store_secret NAME KEY VALUE: one agent credential, in the secrets namespace.
+store_secret() {
+  SECRET_NAME="$1" CREDENTIAL_KEY="$2" CREDENTIAL_JSON="$(printf '%s' "$3" | json_quote)" \
+    render "${KIT_DIR}/manifests/agent-secret.yaml.tmpl" | k apply -f -
 }
 
 # The real credential for the k8s.io provider, from the environment.
@@ -422,11 +475,19 @@ cmd_deploy() {
   # the key from the running hub when the local copy is missing.
   [[ -s "${STATE_DIR}/hub.pub" ]] || hub hubctl pubkey >"${STATE_DIR}/hub.pub" 2>/dev/null || true
   [[ -s "${STATE_DIR}/hub.pub" ]] || { rm -f "${STATE_DIR}/hub.pub"; die "no hub SSH key; run '$0 hub' first"; }
-  if [[ "${CREDENTIAL_PROVIDER}" == k8s.io && -z "$(claude_credential)" ]]; then
-    if [[ "${CLAUDE_AUTH}" == oauth-token ]]; then
-      die "set CLAUDE_CODE_OAUTH_TOKEN to the token 'claude setup-token' printed (it goes into a Kubernetes Secret, never into the actors)"
+  if [[ "${CREDENTIAL_PROVIDER}" == k8s.io ]]; then
+    if agent_enabled claude && [[ -z "$(claude_credential)" ]]; then
+      if [[ "${CLAUDE_AUTH}" == oauth-token ]]; then
+        die "set CLAUDE_CODE_OAUTH_TOKEN to the token 'claude setup-token' printed (it goes into a Kubernetes Secret, never into the actors)"
+      fi
+      die "set ANTHROPIC_API_KEY (it goes into a Kubernetes Secret, never into the actors)"
     fi
-    die "set ANTHROPIC_API_KEY (it goes into a Kubernetes Secret, never into the actors)"
+    if agent_enabled codex && [[ -z "${OPENAI_API_KEY:-}" ]]; then
+      die "AGENTS includes codex: set OPENAI_API_KEY (it goes into a Kubernetes Secret, never into the actors)"
+    fi
+    if agent_enabled agy && [[ -z "${GEMINI_API_KEY:-}" ]]; then
+      die "AGENTS includes agy: set GEMINI_API_KEY (it goes into a Kubernetes Secret, never into the actors)"
+    fi
   fi
 
   local worker_image="${WORKER_IMAGE}"
@@ -440,19 +501,28 @@ cmd_deploy() {
   export WORKER_IMAGE="${worker_image}"
   export ACTOR_IMAGE="${actor_image}"
   export AUTHORIZED_KEYS_JSON; AUTHORIZED_KEYS_JSON="$(json_quote <"${STATE_DIR}/hub.pub")"
-  export CLAUDE_AUTH_ENV CLAUDE_AUTH_PLACEHOLDER
+  export AGENT_ENV; AGENT_ENV="$(agent_env_yaml)"
 
   log "applying WorkerPool (${WORKER_REPLICAS} workers) in namespace ${K8S_NAMESPACE}"
   render "${KIT_DIR}/manifests/workerpool.yaml.tmpl" | k apply -f -
   k -n "${K8S_NAMESPACE}" rollout status deployment/herdr-agents --timeout=10m
 
   if [[ "${CREDENTIAL_PROVIDER}" == k8s.io ]]; then
-    log "storing the ${CLAUDE_AUTH} in ${SECRETS_NAMESPACE}/anthropic"
-    CREDENTIAL_KEY="${CREDENTIAL_KEY}" CREDENTIAL_JSON="$(claude_credential | json_quote)" \
-      render "${KIT_DIR}/manifests/anthropic-secret.yaml.tmpl" | k apply -f -
+    if agent_enabled claude; then
+      log "storing the Claude ${CLAUDE_AUTH} in ${SECRETS_NAMESPACE}/anthropic"
+      store_secret anthropic "${CREDENTIAL_KEY}" "$(claude_credential)"
+    fi
+    if agent_enabled codex; then
+      log "storing the OpenAI API key in ${SECRETS_NAMESPACE}/openai"
+      store_secret openai api-key "${OPENAI_API_KEY}"
+    fi
+    if agent_enabled agy; then
+      log "storing the Gemini API key in ${SECRETS_NAMESPACE}/gemini"
+      store_secret gemini api-key "${GEMINI_API_KEY}"
+    fi
     grant_secret_namespace
   else
-    log "credential provider ${CREDENTIAL_PROVIDER}: the ${CLAUDE_AUTH} stays in its store (${CREDENTIAL_URI})"
+    log "credential provider ${CREDENTIAL_PROVIDER}: credentials stay in its store (${AGENTS})"
   fi
 
   ate get atespace "${ATESPACE}" >/dev/null 2>&1 || ate create atespace "${ATESPACE}"
@@ -578,41 +648,67 @@ cmd_web() {
 cmd_verify() {
   local name="${1:-}"; [[ -n "${name}" ]] || die "usage: $0 verify <name>"
   validate_name "${name}"
-  local out
+  local failed=0
+  if agent_enabled claude; then verify_claude "${name}" || failed=1; fi
+  if agent_enabled codex; then
+    verify_api "${name}" OpenAI "https://api.openai.com/v1/models" \
+      "Authorization: Bearer sk-placeholder" '.data' || failed=1
+  fi
+  if agent_enabled agy; then
+    verify_api "${name}" Gemini "https://generativelanguage.googleapis.com/v1beta/models" \
+      "x-goog-api-key: placeholder" '.models' || failed=1
+  fi
+  (( failed == 0 )) || die "${name}: at least one credential was not injected (see above)"
+}
+
+# run_in_actor NAME CMD: run CMD in actor NAME, over SSH from the hub.
+run_in_actor() {
+  # shellcheck disable=SC2016 # expanded by the hub's shell
+  hub sh -c 'ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-$1" "$2"' sh "$1" "$2" 2>&1
+}
+
+# verify_api NAME LABEL URL HEADER FIELD [EXTRA_HEADER]: list models with a
+# placeholder credential; a non-empty list proves the gateway injected the
+# real one. Listing models costs nothing.
+verify_api() {
+  local name="$1" label="$2" url="$3" header="$4" field="$5" extra="${6:-}" out
+  local headers="-H '${header}'"
+  [[ -z "${extra}" ]] || headers+=" -H '${extra}'"
+  log "calling ${url%%/v1*} from ${name} with a placeholder ${label} key"
+  out="$(run_in_actor "${name}" "curl -sS --max-time 30 '${url}' ${headers} --cacert /run/ate/trust-bundle.pem")" \
+    || { warn "${name}: could not run the ${label} check: ${out:0:300}"; return 1; }
+  python3 - "${name}" "${label}" "${field#.}" "${out}" <<'PY'
+import json, sys
+name, label, field, out = sys.argv[1:]
+try:
+    data = json.loads(out)
+except ValueError:
+    sys.exit(f"{name}: unexpected {label} response (egress policy or gateway?):\n{out[:400]}")
+models = data.get(field) or []
+if models:
+    first = models[0].get("id") or models[0].get("name") or "?"
+    print(f"OK: {name} reached the {label} API with the injected key ({len(models)} models, e.g. {first})")
+else:
+    sys.exit(f"{name}: {label} API answered with an error (key not injected?):\n{json.dumps(data)[:400]}")
+PY
+}
+
+verify_claude() {
+  local name="$1" out
   if [[ "${CLAUDE_AUTH}" == oauth-token ]]; then
     # A subscription token is meant for Claude Code, so check with Claude Code:
     # one short reply from the smallest model, with the placeholder token.
     log "asking Claude Code in ${name} for a one-word reply, with the placeholder token"
-    # shellcheck disable=SC2016 # expanded by the hub's shell
-    out="$(hub sh -c 'ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-$1" \
-      "cd /work && CLAUDE_CODE_OAUTH_TOKEN=$2 NODE_EXTRA_CA_CERTS=/run/ate/trust-bundle.pem timeout 120 claude -p \"Reply with the single word OK.\" --model haiku 2>&1"' \
-      sh "${name}" "${CLAUDE_AUTH_PLACEHOLDER}" 2>&1)" || true
+    out="$(run_in_actor "${name}" "cd /work && CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_AUTH_PLACEHOLDER} NODE_EXTRA_CA_CERTS=/run/ate/trust-bundle.pem timeout 120 claude -p 'Reply with the single word OK.' --model haiku 2>&1")" || true
     if grep -q 'OK' <<<"${out}" && ! grep -qi 'error\|failed' <<<"${out}"; then
       log "OK: ${name} reached Claude with the injected subscription token"
-    else
-      die "${name}: Claude Code could not use the injected token (egress policy, token, or plan?):
-${out:0:600}"
+      return 0
     fi
-    return
+    warn "${name}: Claude Code could not use the injected token (egress policy, token, or plan?): ${out:0:600}"
+    return 1
   fi
-  log "calling api.anthropic.com from ${name} with the placeholder key"
-  # shellcheck disable=SC2016 # expanded by the hub's shell
-  out="$(hub sh -c 'ssh -F "${HOME}/.ssh/config" -o BatchMode=yes "ate-$1" \
-    "curl -sS --max-time 30 https://api.anthropic.com/v1/models -H x-api-key:placeholder -H anthropic-version:2023-06-01 --cacert /run/ate/trust-bundle.pem"' sh "${name}" 2>&1)" \
-    || die "could not run the check in ${name}: ${out}"
-  python3 - "${name}" "${out}" <<'PY'
-import json, sys
-name, out = sys.argv[1], sys.argv[2]
-try:
-    data = json.loads(out)
-except ValueError:
-    sys.exit(f"{name}: unexpected response (egress policy or gateway?):\n{out[:400]}")
-if data.get("data"):
-    ids = [m.get("id", "?") for m in data["data"]]
-    print(f"OK: {name} reached the Anthropic API with the injected key ({len(ids)} models, e.g. {ids[0]})")
-else:
-    sys.exit(f"{name}: API answered with an error (key not injected?):\n{json.dumps(data)[:400]}")
-PY
+  verify_api "${name}" Anthropic "https://api.anthropic.com/v1/models" "x-api-key: placeholder" '.data' \
+    "anthropic-version: 2023-06-01" || return 1
 }
 
 cmd_debug() {
@@ -681,7 +777,7 @@ Usage: $0 <command> [args]
   resume <name>     via the hub: resume actor, wake the client sessions
   status            actors and herdr machines, as the hub sees them
   logs              follow the hub (idle bridge decisions)
-  verify <name>     check that actor <name> reaches Anthropic with the injected key or token
+  verify <name>     check that actor <name> reaches each agent's API (AGENTS) with injected credentials
   debug <name>      actor state and logs, hub logs, ssh -vvv from the hub
   down              delete actors, template, atespace, hub and namespaces
 EOF

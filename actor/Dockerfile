@@ -1,4 +1,5 @@
-# Actor image: a herdr server + Claude Code, reachable only through
+# Actor image: a herdr server + Claude Code, Codex and Antigravity CLI (agy),
+# reachable only through
 # SSH-over-WebSocket on port 80 (the one port substrate's router forwards).
 #
 # Build for the kind registry (setup does this for you):
@@ -9,6 +10,7 @@ ARG TARGETARCH
 ARG HERDR_VERSION=0.9.5
 ARG WEBSOCAT_VERSION=1.14.0
 ARG CLAUDE_CODE_VERSION=latest
+ARG CODEX_VERSION=latest
 
 # openssh-server: the SSH endpoint herdr's saved machines connect to.
 # python3 + bash: required by herdr's Claude Code hook script.
@@ -38,19 +40,32 @@ RUN set -eu; \
     echo "${websocat_sha}  /usr/local/bin/websocat" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/herdr /usr/local/bin/websocat
 
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}" \
  && npm cache clean --force
+
+# Antigravity CLI (agy), from Google's installer, which verifies the binary's
+# SHA-512. The installer has no version pin: rebuild to update, since the
+# CLI's self-updater can't reach Google from inside an actor.
+RUN curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh \
+ && bash /tmp/agy-install.sh --dir /usr/local/bin --skip-path --skip-aliases \
+ && rm -f /tmp/agy-install.sh \
+ && agy --version
 
 # Substrate runs the process as UID 0 with only the image ENV (no implicit
 # HOME), so set it explicitly.
 ENV HOME=/root \
     LANG=C.UTF-8 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    AGY_CLI_DISABLE_AUTO_UPDATE=true
 
 # Bake herdr's Claude Code hook in: it reports session IDs to the herdr server
 # *inside* this actor, so native resume works without crossing the sandbox.
-RUN mkdir -p /root/.claude /work \
- && herdr integration install claude
+RUN mkdir -p /root/.claude /root/.codex /root/.gemini/config /work \
+ && herdr integration install claude \
+ && herdr integration install codex \
+ && herdr integration install antigravity-cli
+COPY codex-config.toml /tmp/codex-config.toml
+RUN cat /tmp/codex-config.toml >>/root/.codex/config.toml && rm /tmp/codex-config.toml
 
 # Skip Claude Code's first-run onboarding. Its setup connectivity check also
 # probes platform.claude.com (Console/claude.ai sign-in), which the actor's
@@ -61,9 +76,11 @@ RUN printf '{"hasCompletedOnboarding": true}\n' >/root/.claude.json
 COPY sshd_config /etc/ssh/sshd_config.d/actor.conf
 COPY herdr-config.toml /root/.config/herdr/config.toml
 COPY entrypoint.sh /usr/local/bin/herdr-actor-entrypoint
+# Points each agent CLI at the placeholder credential the template provides.
+COPY agent-setup /usr/local/bin/agent-setup
 # Holds herdr client sessions across suspends (the hub's herdr-keeper attaches).
 COPY herdr-anchor /usr/local/bin/herdr-anchor
-RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint /usr/local/bin/herdr-anchor
+RUN chmod 0755 /usr/local/bin/herdr-actor-entrypoint /usr/local/bin/herdr-anchor /usr/local/bin/agent-setup
 
 WORKDIR /work
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/herdr-actor-entrypoint"]

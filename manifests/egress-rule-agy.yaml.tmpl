@@ -1,0 +1,14 @@
+# Egress rule for the Antigravity CLI, agy (AGENTS includes agy), added to each
+# actor's policy.
+#
+# agy uses a Gemini API key when its settings say modelProvider "gemini"
+# (agent-setup writes that). The Gemini API takes the key in the
+# x-goog-api-key header, which the gateway replaces with the real key from
+# ${GEMINI_CREDENTIAL_URI}.
+rules:
+- https:
+    hostnames: ["generativelanguage.googleapis.com"]
+    effects:
+      replaceHeaders:
+      - header: x-goog-api-key
+        credentialUri: ${GEMINI_CREDENTIAL_URI}

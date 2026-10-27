@@ -218,7 +218,8 @@ gcloud auth configure-docker "$REGISTRY_HOST"
 A dedicated VPC needs three things:
 
 - **Private Google Access**, so private nodes reach Artifact Registry, GCS and Secret Manager.
-- **Cloud NAT**, the only way out to `api.anthropic.com`.
+- **Cloud NAT**, the only way out to `api.anthropic.com` (and `api.openai.com` and
+  `generativelanguage.googleapis.com` for Codex and agy).
 - **Private services access**, which Cloud SQL's private IP needs.
 
 ```bash
@@ -529,6 +530,24 @@ PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(project
 gcloud secrets add-iam-policy-binding "$ANTHROPIC_SECRET" --role=roles/secretmanager.secretAccessor --member="principal://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$PROJECT_ID.svc.id.goog/subject/ns/ate-system/sa/gsm-credential-provider"
 ```
 
+**Codex and agy.** If actors should also run Codex or the Antigravity CLI ([Agents](../README.md#agents)), store
+their API keys the same way, let the provider read them, and record the choice for step 10:
+
+```bash
+echo 'export AGENTS=claude,codex,agy' >> ~/herdr-prod/gke.env
+source ~/herdr-prod/gke.env
+printf 'OpenAI API key: '; read -rs key; printf '\n'
+printf '%s' "$key" | gcloud secrets create openai-api-key --replication-policy=user-managed --locations="$REGION" --data-file=-
+printf 'Gemini API key: '; read -rs key; printf '\n'
+printf '%s' "$key" | gcloud secrets create gemini-api-key --replication-policy=user-managed --locations="$REGION" --data-file=-
+unset key
+for secret in openai-api-key gemini-api-key; do
+  gcloud secrets add-iam-policy-binding "$secret" --role=roles/secretmanager.secretAccessor --member="principal://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$PROJECT_ID.svc.id.goog/subject/ns/ate-system/sa/gsm-credential-provider"
+done
+```
+
+Leave out the one you don't need, and list only the others in `AGENTS`.
+
 Next comes the provider's own policy, which is default-deny: actors in `herdr-agents` may resolve secrets in
 this project. Then build the provider pinned by digest, review the manifest, and apply it. Its image goes to
 the mutable `herdr` repository, because ko tags every build `latest`.
@@ -581,6 +600,9 @@ WORKER_NODE_SELECTOR='{"ate.dev/sandboxClass": "gvisor"}'
 WORKER_REPLICAS=3
 IDLE_SECONDS=900
 CLAUDE_AUTH=${CLAUDE_AUTH:-api-key}
+AGENTS=${AGENTS:-claude}
+OPENAI_CREDENTIAL_URI=ate-secret://secretmanager.googleapis.com/projects/${PROJECT_ID}/secrets/openai-api-key/versions/latest
+GEMINI_CREDENTIAL_URI=ate-secret://secretmanager.googleapis.com/projects/${PROJECT_ID}/secrets/gemini-api-key/versions/latest
 CREDENTIAL_PROVIDER=secretmanager.googleapis.com
 CREDENTIAL_URI=ate-secret://secretmanager.googleapis.com/projects/${PROJECT_ID}/secrets/${ANTHROPIC_SECRET}/versions/latest
 ATE_CLIENT_SERVICE_ACCOUNT=herdr-operator

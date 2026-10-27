@@ -1,6 +1,8 @@
 # herdr config inside the actor (~/.config/herdr/config.toml).
 #
-# Actors have default-deny egress; the only allowed host is api.anthropic.com.
+# Actors have default-deny egress; only their agents' APIs are allowed
+# (api.anthropic.com, and api.openai.com or generativelanguage.googleapis.com
+# when AGENTS includes codex or agy).
 # Stop herdr from trying to reach herdr.dev for release and detection-manifest
 # checks: they would only fail, and the actor image pins its herdr version.
 # Upgrade by rebuilding the image instead.

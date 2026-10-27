@@ -36,6 +36,13 @@ HUB_WEB_ADDR="${HUB_WEB_ADDR:-127.0.0.1}"
 HUB_WEB_AUTH_HEADER="${HUB_WEB_AUTH_HEADER:-}"
 # Local port `web` listens on.
 WEB_PORT="${WEB_PORT:-7681}"
+# How substrate's egress gateway (atenet-egress) resolves upstream hosts.
+# Substrate ships ALL, which tries IPv6 first; where pods have no IPv6 route
+# (kind on Docker Desktop, most IPv4-only clusters) that attempt fails at once
+# with "network unreachable" and the request ends in a 503 instead of falling
+# back to IPv4. V4_PREFERRED uses IPv4 when a host has an A record and still
+# reaches IPv6-only hosts. Empty leaves substrate's setting alone.
+EGRESS_DNS_FAMILY="${EGRESS_DNS_FAMILY-V4_PREFERRED}"
 # Image platform; empty builds for this machine's architecture (right for kind).
 # Set it to the cluster nodes' platform elsewhere, e.g. linux/amd64.
 PLATFORM="${PLATFORM:-}"
@@ -320,6 +327,7 @@ cmd_cluster() {
   # memory and disk.
   log "scaling the counter demo's workers to 0 (only its worker image is used)"
   k -n ate-demo-counter patch workerpool counter --type merge -p '{"spec":{"replicas":0}}'
+  cmd_egress_dns
   log "installing kubectl-ate"
   ( cd "${SUBSTRATE_DIR}" && go install ./cmd/kubectl-ate )
   command -v kubectl-ate >/dev/null || warn "kubectl-ate is not on PATH; add \$(go env GOPATH)/bin"
@@ -760,6 +768,47 @@ cmd_up() {
   log "attach with: $0 attach"
 }
 
+# Set dns_lookup_family in the egress gateway's Envoy config to
+# EGRESS_DNS_FAMILY, then restart it. Idempotent; re-run it after every
+# substrate install or upgrade, which puts substrate's own value back.
+cmd_egress_dns() {
+  local family="${EGRESS_DNS_FAMILY}"
+  if [[ -z "${family}" ]]; then
+    log "EGRESS_DNS_FAMILY is empty; leaving the egress gateway's DNS settings as substrate ships them"
+    return 0
+  fi
+  case "${family}" in
+    ALL|AUTO|V4_ONLY|V6_ONLY|V4_PREFERRED) ;;
+    *) die "EGRESS_DNS_FAMILY must be V4_PREFERRED, ALL, AUTO, V4_ONLY, V6_ONLY or empty (got '${family}')" ;;
+  esac
+  local cm current patched
+  cm="$(k -n ate-system get configmap atenet-egress -o json)" \
+    || die "no ConfigMap ate-system/atenet-egress; install substrate first"
+  current="$(printf '%s' "${cm}" | python3 -c '
+import json, re, sys
+conf = json.load(sys.stdin)["data"]["envoy.yaml"]
+print(" ".join(sorted(set(re.findall(r"dns_lookup_family:\s*(\w+)", conf)))))')"
+  if [[ -z "${current}" ]]; then
+    warn "atenet-egress has no dns_lookup_family setting; substrate's config changed, check it by hand"
+    return 0
+  fi
+  if [[ "${current}" == "${family}" ]]; then
+    log "egress gateway already resolves with ${family}"
+    return 0
+  fi
+  log "egress gateway: dns_lookup_family ${current} -> ${family}"
+  patched="$(printf '%s' "${cm}" | FAMILY="${family}" python3 -c '
+import json, os, re, sys
+cm = json.load(sys.stdin)
+for key in ("resourceVersion", "uid", "creationTimestamp", "managedFields"):
+    cm["metadata"].pop(key, None)
+cm["data"]["envoy.yaml"] = re.sub(r"(dns_lookup_family:\s*)\w+", r"\g<1>" + os.environ["FAMILY"], cm["data"]["envoy.yaml"])
+print(json.dumps(cm))')"
+  printf '%s' "${patched}" | k replace -f - >/dev/null
+  k -n ate-system rollout restart deployment/atenet-egress >/dev/null
+  k -n ate-system rollout status deployment/atenet-egress --timeout=180s
+}
+
 usage() {
   cat <<EOF
 Usage: $0 <command> [args]
@@ -767,6 +816,7 @@ Usage: $0 <command> [args]
   up [names...]     everything below, in order (default actors: luna mars orion)
   check             verify local prerequisites
   cluster           kind cluster + substrate (router allowlists the hub) + demo-counter
+  egress-dns        set the egress gateway's DNS family (EGRESS_DNS_FAMILY); cluster runs it
   image             build the actor image, push it to the kind registry
   hub-image         build kubectl-ate and the hub image, push it
   hub               deploy the hub pod; it generates its SSH key
@@ -792,6 +842,7 @@ main() {
     up) cmd_up "$@" ;;
     check) cmd_check ;;
     cluster) cmd_cluster ;;
+    egress-dns) cmd_egress_dns ;;
     image) cmd_image ;;
     hub-image) cmd_hub_image ;;
     hub) cmd_hub ;;

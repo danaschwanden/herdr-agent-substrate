@@ -463,6 +463,18 @@ kubectl --context "$KUBE_CONTEXT" -n ate-system logs deployment/ate-api-server -
 - atelet on `agents` nodes;
 - the proxy log ending in "ready for new connections".
 
+Then make the egress gateway prefer IPv4. Substrate ships it with `dns_lookup_family: ALL`, and where pods
+have no IPv6 route its IPv6 attempt fails with "network unreachable" and the request ends in a 503 instead of
+falling back to IPv4. `V4_PREFERRED` uses IPv4 when a host has an A record and still reaches IPv6-only hosts.
+The kit's `egress-dns` command patches the gateway's ConfigMap and restarts it:
+
+```bash
+"$KIT_DIR/host/herdr-substrate.sh" egress-dns
+```
+
+Every substrate install or upgrade puts `ALL` back, so run it again after each. On a dual-stack cluster whose
+pods do reach IPv6 it is optional; `EGRESS_DNS_FAMILY=` (empty) skips it.
+
 ## 8. Identities and the atespace
 
 Two ServiceAccounts become ate-api principals:
@@ -1120,7 +1132,7 @@ kubectl --context "$KUBE_CONTEXT" -n herdr-hub exec deploy/herdr-hub -- hubctl p
 | GKE | Release channel auto-upgrades. Workers get `SIGTERM` and 30 minutes to suspend their actors, so set a maintenance window |
 | herdr or Claude Code | Rebuild with `image` (and `hub-image` for herdr). Templates are immutable, so new agents need a new template: run `down` and `deploy` in a maintenance window, then recreate the actors. `down` deletes the actors. For a new herdr version, run `test/keeper-test.py` and `test/hub-path-test.sh` first: the always-on keeper relies on herdr's endpoint protocol |
 | Substrate, patch release | In place, by substrate's upgrade runbook (`docs/upgrade.md`), once releases are 1.0 or later |
-| Substrate, new minor before 1.0 | Not supported in place. Stand up a second cluster from this guide at the new version, move operators over, delete the old one |
+| Substrate, new minor before 1.0 | Not supported in place. Stand up a second cluster from this guide at the new version (including `egress-dns`), move operators over, delete the old one |
 
 ### Tear down
 
@@ -1155,6 +1167,7 @@ Start with the [kit's troubleshooting chain](../README.md#troubleshooting). GKE-
 | `cloud-sql-proxy`: `PERMISSION_DENIED` | GSA missing `roles/cloudsql.client`, or its Workload Identity binding; re-run step 5's `create cloudsql` |
 | ate-api: `role "substrate_owner" does not exist` / `permission denied for schema substrate` | Step 5's grants did not run |
 | First suspend or resume fails with GCS `403` | Step 4's `create iam` missing, or Workload Identity off on the cluster |
+| `verify` or agents: `503 upstream connect error … remote connection failure`, and the gateway's envoy log shows `Network_is_unreachable` to an IPv6 address | The gateway is back on `dns_lookup_family: ALL`, typically after a substrate install: `"$KIT_DIR/host/herdr-substrate.sh" egress-dns` |
 | `verify`: HTTP 503 | The Secret Manager provider isn't serving: `kubectl -n ate-system rollout status deployment/gsm-credential-provider` |
 | `verify`: HTTP 403 | Provider refused: the project policy lacks `herdr-agents`, or the secret's IAM binding is missing. `kubectl -n ate-system logs deployment/gsm-credential-provider` and `kubectl -n ate-system logs deployment/atenet-egress -c ext-proc \| grep 'egress denied'` |
 | `verify` times out | No Cloud NAT, so nothing leaves the private nodes |

@@ -233,8 +233,15 @@ host/herdr-substrate.sh cluster
 
 This is the long step: 15–30 minutes the first time, mostly substrate building its Envoy router image. It
 creates the kind cluster and registry, installs substrate with the hub's identity on the router's allowlist,
-deploys substrate's counter demo (only to reuse its worker image; its workers are scaled to 0), and installs
-`kubectl-ate`. It ends by reporting Docker's free disk space.
+deploys substrate's counter demo (only to reuse its worker image; its workers are scaled to 0), sets the egress
+gateway to prefer IPv4 (`egress-dns`, below), and installs `kubectl-ate`. It ends by reporting Docker's free
+disk space.
+
+Substrate's egress gateway resolves upstream hosts with `dns_lookup_family: ALL`. On kind under Docker Desktop
+pods have no IPv6 route, and the gateway's first attempt, to the host's IPv6 address, fails with "network
+unreachable" instead of falling back to IPv4: agents see `503 upstream connect error`. `cluster` therefore
+switches it to `V4_PREFERRED`, which uses IPv4 when a host has an A record and still reaches IPv6-only hosts.
+`EGRESS_DNS_FAMILY` picks another value, or empty to keep substrate's.
 
 Check that the control plane is healthy before continuing; every pod in `ate-system` should be fully ready
 (`2/2`, `1/1`, …) except `rustfs-bucket-init`, which is `Completed`:
@@ -893,6 +900,7 @@ only apply to the kind registry.
 | `hub-image` | cross-builds `kubectl-ate` from your substrate checkout into `hub/bin/linux-<arch>/`, builds and pushes `hub/`. Not needed with a prebuilt `HUB_IMAGE` |
 | `hub` | applies `manifests/hub.yaml.tmpl` and the default egress policy for `hubctl create`; waits for the hub's SSH key |
 | `deploy` | WorkerPool, Anthropic Secret + credential-provider grant, atespace, hub access policy, ActorTemplate trusting the hub key; waits for the golden snapshot |
+| `egress-dns` | sets the egress gateway's `dns_lookup_family` to `EGRESS_DNS_FAMILY` and restarts it; `cluster` runs it. Re-run it after reinstalling substrate |
 | `actor <name>` | creates the actor and its egress policy |
 | `machine <name>` | `hubctl add <name>` in the hub: pins the host key, `herdr machine add` |
 | (in the hub) `hubctl create <name>` / `hubctl delete <name>` | `actor` plus `machine`, and `delete`, from a shell in the hub ([Agents from inside the hub](#agents-from-inside-the-hub)) |
@@ -1340,6 +1348,7 @@ Desktop, `BUILDX_BUILDER` (step 4); everything else has a working default.
 | `IDLE_SECONDS` | `300` | idle time before the hub suspends an actor (applied by `hub`) |
 | `POLL_SECONDS` | `30` | idle-bridge poll interval (applied by `hub`) |
 | `ATE_INGRESS_ALLOWED_SPIFFE_IDS` | — | extra router clients; the hub's ID is always added |
+| `EGRESS_DNS_FAMILY` | `V4_PREFERRED` | the egress gateway's `dns_lookup_family` (applied by `cluster` and `egress-dns`); empty keeps substrate's `ALL` |
 | `WEB_PORT` | `7681` | local port `web` forwards from |
 | `WEB_OPEN` | `true` | `web` opens your browser; `false` only prints the URL |
 
@@ -1630,6 +1639,7 @@ the hub.
 | Web: selecting text doesn't copy, or says "The browser blocked the copy" | the page isn't on `localhost` or `https` (browsers only allow clipboard access there), or Safari refused. Use `web`'s `http://localhost` URL or the shared `https` link; Chrome and Edge allow it |
 | Web: the browser's menu still covers herdr's on right-click | the hub started without its page (`logs` shows "could not build the web page"), or runs an older image: `hub-image`, then `hub` |
 | The web page says "Press ⏎ to Reconnect" | the WebSocket dropped (laptop asleep, `web` stopped, proxy timeout). Restart `web` if needed and press Enter: a fresh herdr client starts, nothing on the hub or the actors is lost |
+| Agents get `503 upstream connect error … remote connection failure`; the gateway log (`kubectl -n ate-system logs deployment/atenet-egress -c envoy`) shows `Network_is_unreachable` to an IPv6 address | the egress gateway tries IPv6 and pods have no IPv6 route. Run `host/herdr-substrate.sh egress-dns` (`cluster` does it, but reinstalling substrate puts `ALL` back) |
 | zsh: a pasted command waits at `quote>` | it contained a `#` comment with an apostrophe; press Ctrl-C. `setopt interactive_comments` in `~/.zshrc` makes zsh accept comments |
 
 ## Changelog
@@ -1682,3 +1692,7 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   also installs the default egress policy in the hub.
 - **Container `/tmp`:** the actor entrypoint sets `/tmp` and `/var/tmp` to mode 1777, which Claude Code needs
   for its cross-session messaging socket.
+- **Egress over IPv4:** `cluster` sets substrate's egress gateway to `dns_lookup_family: V4_PREFERRED`. With
+  substrate's `ALL`, an IPv6 attempt that fails with "network unreachable" (kind on Docker Desktop) ended in a
+  503 instead of falling back to IPv4. The new `egress-dns` command applies it to any cluster; both production
+  guides run it after installing substrate. `EGRESS_DNS_FAMILY` overrides it.

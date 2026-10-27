@@ -598,6 +598,21 @@ kubectl --context "$KUBE_CONTEXT" -n ate-system get pods -o wide
 The run prints every resolved setting and where it came from, and logs "Skipping bundled PostgreSQL". Commit
 `substrate-install.yaml` and the record in `$OPS_DIR/substrate-installs/`. Neither contains a secret.
 
+Then make the egress gateway prefer IPv4. Substrate ships it with `dns_lookup_family: ALL`, and where pods
+have no IPv6 route its IPv6 attempt fails with "network unreachable" and the request ends in a 503 instead of
+falling back to IPv4. `V4_PREFERRED` uses IPv4 when a host has an A record and still reaches IPv6-only hosts.
+The kit's `egress-dns` command patches the gateway's ConfigMap and restarts it:
+
+```bash
+"$KIT_DIR/host/herdr-substrate.sh" egress-dns
+```
+
+Every substrate install or upgrade puts `ALL` back, so run it again after each. On a dual-stack cluster whose
+pods do reach IPv6 it is optional; `EGRESS_DNS_FAMILY=` (empty) skips it.
+
+This isn't part of the overlay in step 7: the installer applies the egress gateway's manifest on its own, not
+through `manifests/ate-install/base`.
+
 ## 9. Identities and the atespace
 
 Same as [GKE step 8](production-gke.md#8-identities-and-the-atespace):
@@ -1300,7 +1315,7 @@ kubectl --context "$KUBE_CONTEXT" -n herdr-hub exec deploy/herdr-hub -- hubctl p
 |---|---|
 | Kubernetes | Your distribution's process. Drain agent nodes one at a time: workers get `SIGTERM` and 30 minutes to suspend their actors |
 | herdr or Claude Code | As on GKE: rebuild, then `down` and `deploy` in a maintenance window (`down` deletes the actors). For a new herdr version, run `test/keeper-test.py` and `test/hub-path-test.sh` first: the always-on keeper relies on herdr's endpoint protocol |
-| Substrate, new minor before 1.0 | Not supported in place. Build a new cluster at the new release, port the overlay patch, move operators, retire the old one |
+| Substrate, new minor before 1.0 | Not supported in place. Build a new cluster at the new release, port the overlay patch, run `egress-dns`, move operators, retire the old one |
 
 ### Tear down
 
@@ -1320,6 +1335,7 @@ Start with the [kit's troubleshooting chain](../README.md#troubleshooting). Upst
 
 | Symptom | Cause and fix |
 |---|---|
+| `verify` or agents: `503 upstream connect error … remote connection failure`, and the gateway's envoy log shows `Network_is_unreachable` to an IPv6 address | The gateway is back on `dns_lookup_family: ALL`, typically after a substrate install: `"$KIT_DIR/host/herdr-substrate.sh" egress-dns` |
 | Install fails on `PodMonitoring` / `no matches for kind` | The overlay wasn't written into `$SUBSTRATE_DIR` before `deploy ate-system` (step 7) |
 | Install hangs at "Waiting for podcertificate ClusterTrustBundles" | Kubernetes below 1.37 without the 1.36 gates; `kubectl api-resources --api-group=certificates.k8s.io` |
 | `deploy ate-system`: "uses an external PostgreSQL, but ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING is not set" | Paste the step 5 `export` lines into the shell first |

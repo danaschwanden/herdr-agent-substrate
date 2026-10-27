@@ -64,8 +64,11 @@ RUN mkdir -p /root/.claude /root/.codex /root/.gemini/config /work \
  && herdr integration install claude \
  && herdr integration install codex \
  && herdr integration install antigravity-cli
+# Our settings go first: they are top-level keys, and herdr's integration has
+# already opened a [features] table that anything after it would land in.
 COPY codex-config.toml /tmp/codex-config.toml
-RUN cat /tmp/codex-config.toml >>/root/.codex/config.toml && rm /tmp/codex-config.toml
+RUN cat /tmp/codex-config.toml /root/.codex/config.toml >/tmp/codex-merged.toml \
+ && mv /tmp/codex-merged.toml /root/.codex/config.toml && rm /tmp/codex-config.toml
 
 # Skip Claude Code's first-run onboarding. Its setup connectivity check also
 # probes platform.claude.com (Console/claude.ai sign-in), which the actor's

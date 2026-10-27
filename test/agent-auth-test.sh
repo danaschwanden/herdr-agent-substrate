@@ -135,12 +135,16 @@ PY
   docker logs "${NAME}-gw" >"${WORK}/before" 2>&1
   docker run --rm --network "${NAME}" "${add_hosts[@]}" "${mounts[@]}" \
     -v "${WORK}/ca.crt:/run/ate/trust-bundle.pem:ro" -v "${KIT_DIR}/actor/agent-setup:/opt/test/agent-setup:ro" \
+    -v "${KIT_DIR}/actor/codex-config.toml:/opt/test/codex-config.toml:ro" \
     --env-file "${WORK}/env" -e HOME=/tmp/home -e NODE_EXTRA_CA_CERTS=/run/ate/trust-bundle.pem \
     -e PATH="${path_prefix}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     --entrypoint bash "${IMAGE}" -c '
       mkdir -p /usr/local/share/ca-certificates /tmp/home/.codex /tmp/home/.gemini /tmp/w && cd /tmp/w
       cp /run/ate/trust-bundle.pem /usr/local/share/ca-certificates/ate-egress-mitm.crt && update-ca-certificates >/dev/null 2>&1
       printf "{\"hasCompletedOnboarding\": true}\n" >/tmp/home/.claude.json
+      # Codex config as the image builds it: ours first, then herdr'"'"'s integration.
+      if command -v herdr >/dev/null; then herdr integration install codex >/dev/null 2>&1 || true; fi
+      cat /opt/test/codex-config.toml /tmp/home/.codex/config.toml 2>/dev/null >/tmp/codex.toml; mv /tmp/codex.toml /tmp/home/.codex/config.toml
       bash /opt/test/agent-setup
       timeout 120 '"${cmd}"' </dev/null 2>&1 | tail -n 3' >"${WORK}/cli.out" 2>&1 || true
   sleep 1

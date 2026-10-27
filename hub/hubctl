@@ -33,6 +33,12 @@ die()  { log "error: $*"; exit 1; }
 
 ate() { kubectl-ate --endpoint "${ATE_API_ENDPOINT}" --token-file "${ATE_API_TOKEN}" "$@"; }
 
+# ate_actor VERB KIND NAME [ARGS...]: an ate call on one object in ATESPACE.
+ate_actor() {
+  local verb="$1" kind="$2" name="$3"; shift 3
+  ate "${verb}" "${kind}" "${name}" -a "${ATESPACE}" "$@"
+}
+
 validate_name() {
   [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "actor name '$1' must be a DNS label"
 }
@@ -43,6 +49,33 @@ machine_id() {
 import json, sys
 rows = [r for r in json.load(sys.stdin) if r["label"] == sys.argv[1]]
 print(rows[0]["id"] if rows else "")' "$1"
+}
+
+# ate_machines FIELD [disabled]: FIELD (label or id) of every saved ate-*
+# machine, one per line; with "disabled", only the disabled ones.
+ate_machines() {
+  herdr machine list --json | python3 -c '
+import json, sys
+field, only_disabled = sys.argv[1], sys.argv[2:] == ["disabled"]
+for r in json.load(sys.stdin):
+    if r["target"].startswith("ate-") and not (only_disabled and r["enabled"]):
+        print(r[field])' "$@"
+}
+
+# park_refusals: reads keeper replies to a park request, prints the ones that
+# did not park (comma-separated), nothing if all parked.
+park_refusals() {
+  python3 -c '
+import json, sys
+bad = []
+for line in sys.stdin.read().splitlines():
+    try:
+        reply = json.loads(line)
+    except ValueError:
+        bad.append(line); continue
+    if reply.get("result") != "parked":
+        bad.append(reply.get("result") or reply.get("error") or line)
+print(", ".join(bad))'
 }
 
 cut_tunnel() { pkill -f -- "ate-target-actor: ${ATESPACE}/$1\$" 2>/dev/null || true; }
@@ -122,20 +155,20 @@ cmd_create() {
   validate_name "${name}"
   [[ -s "${policy}" ]] || die "no egress policy at ${policy}; pass --policy FILE, or run 'host/herdr-substrate.sh hub' to install the default"
 
-  if ate get actor "${name}" -a "${ATESPACE}" >/dev/null 2>&1; then
+  if ate_actor get actor "${name}" >/dev/null 2>&1; then
     log "actor ${ATESPACE}/${name} exists"
   else
     log "creating actor ${ATESPACE}/${name} from template ${HUB_TEMPLATE}"
-    ate create actor "${name}" -a "${ATESPACE}" --template "${HUB_TEMPLATE}" >/dev/null
+    ate_actor create actor "${name}" --template "${HUB_TEMPLATE}" >/dev/null
   fi
   # A missing egress policy prints nothing and exits 0.
-  current="$(ate get egress-policy "${name}" -a "${ATESPACE}" -o json 2>/dev/null)" \
+  current="$(ate_actor get egress-policy "${name}" -o json 2>/dev/null)" \
     || die "could not read the egress policy of ${ATESPACE}/${name}"
   if [[ -n "${current}" ]]; then
     log "egress policy of ${name} exists; left as it is"
   else
     log "egress policy for ${name}: ${policy}"
-    ate create egress-policy "${name}" -a "${ATESPACE}" -f "${policy}" >/dev/null
+    ate_actor create egress-policy "${name}" -f "${policy}" >/dev/null
   fi
   cmd_add "${name}"
   log "created ${name}; it shows up in herdr's sidebar"
@@ -146,9 +179,9 @@ cmd_create() {
 cmd_delete() {
   local name="${1:?usage: hubctl delete <actor>}"; validate_name "${name}"
   cmd_remove "${name}"
-  ate delete egress-policy "${name}" -a "${ATESPACE}" >/dev/null 2>&1 || true
-  if ate get actor "${name}" -a "${ATESPACE}" >/dev/null 2>&1; then
-    ate delete actor "${name}" -a "${ATESPACE}" >/dev/null
+  ate_actor delete egress-policy "${name}" >/dev/null 2>&1 || true
+  if ate_actor get actor "${name}" >/dev/null 2>&1; then
+    ate_actor delete actor "${name}" >/dev/null
     log "deleted actor ${ATESPACE}/${name} and its snapshot"
   else
     log "actor ${ATESPACE}/${name} does not exist"
@@ -156,45 +189,48 @@ cmd_delete() {
 }
 
 cmd_remove() {
-  local name="${1:?usage: hubctl remove <actor>}" id
+  local name="${1:?usage: hubctl remove <actor>}" id; validate_name "${name}"
   id="$(machine_id "${name}")"
   if [[ -n "${id}" ]]; then herdr machine remove "${id}" >/dev/null; fi
+  # Close any keeper still attached to the forgotten machine before cutting
+  # tunnels: a keeper that only lost its tunnel would reconnect through the
+  # router and resume the actor.
+  keepers "${name}" '{"cmd":"close"}' >/dev/null
   cut_tunnel "${name}"
   rm -f "${STATE_DIR}/last-active.${name}"
 }
 
 # suspend NAME [--force]: park NAME's keepers, then suspend the actor. Without
 # --force, a keeper that sees user input (or can't park) cancels the suspend.
+# With --force, keepers that could not park cleanly drop their connection
+# anyway and hold what they had (the anchor replays it on the next wake), so
+# the actor stays suspended until the next input.
 cmd_suspend() {
-  local name="${1:?usage: hubctl suspend <actor> [--force]}" force="${2:-}" replies refused
-  replies="$(keepers "${name}" '{"cmd":"park","timeout":30}')"
-  refused="$(python3 -c '
-import json, sys
-bad = []
-for line in sys.stdin.read().splitlines():
-    try:
-        reply = json.loads(line)
-    except ValueError:
-        bad.append(line); continue
-    if reply.get("result") != "parked":
-        bad.append(reply.get("result") or reply.get("error") or line)
-print(", ".join(bad))' <<<"${replies}")"
-  if [[ -n "${refused}" && "${force}" != --force ]]; then
-    log "${name}: not suspending, keeper reported: ${refused}"
-    return 3
+  local name="${1:?usage: hubctl suspend <actor> [--force]}" force="${2:-}" refused
+  validate_name "${name}"
+  refused="$(keepers "${name}" '{"cmd":"park","timeout":30}' | park_refusals)"
+  if [[ -n "${refused}" ]]; then
+    if [[ "${force}" != --force ]]; then
+      log "${name}: not suspending, keeper reported: ${refused}"
+      return 3
+    fi
+    log "${name}: keeper reported ${refused}; forcing"
+    refused="$(keepers "${name}" '{"cmd":"park","force":true,"timeout":30}' | park_refusals)"
+    [[ -z "${refused}" ]] \
+      || log "${name}: WARNING: keeper could not park (${refused}); it will resume the actor when it reconnects"
   fi
   # herdr's own SSH master (probes, --machine calls) keeps sending keepalives
   # for up to 10 minutes; parked keepers have no connection left to cut.
   cut_tunnel "${name}"
   log "suspending ${ATESPACE}/${name}"
-  ate suspend actor "${name}" -a "${ATESPACE}"
+  ate_actor suspend actor "${name}"
   rm -f "${STATE_DIR}/last-active.${name}"
 }
 
 cmd_resume() {
-  local name="${1:?usage: hubctl resume <actor>}"
+  local name="${1:?usage: hubctl resume <actor>}"; validate_name "${name}"
   log "resuming ${ATESPACE}/${name}"
-  ate resume actor "${name}" -a "${ATESPACE}"
+  ate_actor resume actor "${name}"
   # Attached clients: reconnect now rather than on the next keystroke.
   keepers "${name}" '{"cmd":"wake"}' >/dev/null
   date +%s >"${STATE_DIR}/last-active.${name}"
@@ -222,43 +258,55 @@ print(int(min(idle)) if idle else "")'
 }
 
 # Machines saved before the always-on keeper were disabled while suspended.
+# A one-time migration: once done, a machine disabled on purpose stays so.
 enable_all() {
-  local id
-  for id in $(herdr machine list --json | python3 -c '
-import json, sys
-for r in json.load(sys.stdin):
-    if not r["enabled"] and r["target"].startswith("ate-"):
-        print(r["id"])'); do
+  local id done_marker="${STATE_DIR}/migrated-always-on"
+  [[ -f "${done_marker}" ]] && return 0
+  for id in $(ate_machines id disabled); do
     herdr machine enable "${id}" >/dev/null && log "re-enabled machine ${id}"
   done
+  touch "${done_marker}"
+}
+
+# touch_marker FILE TIME: move the last-activity marker forward to TIME, never
+# back (input seen long ago must not undo a more recent busy agent).
+touch_marker() {
+  local last
+  last="$(cat "$1" 2>/dev/null || echo 0)"
+  (( $2 > last )) && echo "$2" >"$1"
+  return 0
 }
 
 # One pass of the idle bridge. Only RUNNING actors are looked at: polling a
 # suspended one would resume it.
 idle_pass() {
-  local now name state marker idle last
+  local now name state marker unknown idle last
   now="$(date +%s)"
   declare -A states=()
   while read -r name state; do
     [[ -n "${name}" ]] && states["${name}"]="${state}"
   done < <(actor_states)
-  for name in $(herdr machine list --json | python3 -c '
-import json, sys
-for r in json.load(sys.stdin):
-    if r["target"].startswith("ate-"):
-        print(r["label"])'); do
+  for name in $(ate_machines label); do
     marker="${STATE_DIR}/last-active.${name}"
+    unknown="${STATE_DIR}/agents-unknown.${name}"
     if [[ "${states[${name}]:-}" != ACTOR_STATE_RUNNING ]]; then
-      rm -f "${marker}"
+      rm -f "${marker}" "${unknown}"
       continue
     fi
     [[ -f "${marker}" ]] || echo "${now}" >"${marker}"
     idle="$(input_idle "${name}")"
     if [[ -n "${idle}" ]] && (( idle < IDLE_SECONDS )); then
-      echo "$(( now - idle ))" >"${marker}"
+      touch_marker "${marker}" "$(( now - idle ))"
     fi
+    # unknown: the agent list could not be read. Counted as busy, so an actor
+    # is never suspended under an agent we can't see; logged once per spell.
     case "$(agents_busy "${name}")" in
-      busy|unknown) echo "${now}" >"${marker}" ;;
+      busy) touch_marker "${marker}" "${now}"; rm -f "${unknown}" ;;
+      unknown)
+        touch_marker "${marker}" "${now}"
+        [[ -f "${unknown}" ]] \
+          || { log "${name}: WARNING: can't read its agent list; not suspending it until it can be read"; touch "${unknown}"; } ;;
+      *) rm -f "${unknown}" ;;
     esac
     last="$(cat "${marker}")"
     if (( now - last >= IDLE_SECONDS )); then
@@ -282,11 +330,7 @@ cmd_status() {
   echo
   herdr machine list || true
   local name
-  for name in $(herdr machine list --json 2>/dev/null | python3 -c '
-import json, sys
-for r in json.load(sys.stdin):
-    if r["target"].startswith("ate-"):
-        print(r["label"])'); do
+  for name in $(ate_machines label 2>/dev/null); do
     keepers "${name}" '{"cmd":"status"}' | python3 -c '
 import json, sys
 for line in sys.stdin.read().splitlines():
@@ -302,7 +346,8 @@ Usage: hubctl <command> [args]   (atespace: ${ATESPACE})
 
   create <actor> [--policy FILE]
                            new actor from ${HUB_TEMPLATE}, its egress policy (default:
-                           only api.anthropic.com, key injected) and herdr machine
+                           the kit's policy, the APIs of the agents in AGENTS with
+                           credentials injected) and herdr machine
   delete <actor>           remove the machine, the egress policy and the actor
   add <actor>              pin the actor's host key and save it as herdr machine <actor>
   remove <actor>           forget the herdr machine (the actor stays)

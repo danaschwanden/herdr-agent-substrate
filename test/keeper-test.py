@@ -318,6 +318,38 @@ async def main():
         check(reply.get("result") == "busy", "park answered busy", str(reply))
         check(keeper_call(run, {"cmd": "status"})["state"] == "awake", "still awake afterwards")
 
+        print("\n\033[1m7b. forced park while typing: parks, stays parked, loses nothing\033[0m")
+        typed = [bytes([13]) + b"f%02d" % i for i in range(20)]
+        for p in typed:
+            await client.send(p)
+        # Output still flowing: a clean park can't finish in 0.3 s.
+        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park", "timeout": 0.3})
+        check(reply.get("result") == "busy", "clean park refused while output flows", str(reply))
+        for p in typed:
+            await client.send(p)
+        reply = await asyncio.to_thread(keeper_call, run, {"cmd": "park", "force": True, "timeout": 0.3})
+        check(reply.get("result") == "parked", "forced park parks", str(reply))
+        typed = typed + typed
+        os.kill(anchor.pid, signal.SIGSTOP)
+        subprocess.run(["pkill", "-f", f"{sock} attach"])   # hubctl's cut_tunnel
+        connects_before = open(os.path.join(work, "ssh.log")).read().count("connect")
+        await client.send(control(PING, b"pf"))
+        echoes = []
+        while True:     # echoes already on their way, then the local pong
+            r = await client.recv(timeout=5)
+            if r == control(PONG, b"pf"):
+                break
+            echoes.append(r[9:])
+        await asyncio.sleep(2)
+        check(keeper_call(run, {"cmd": "status"})["state"] == "parked", "still parked after the tunnel is cut")
+        check(open(os.path.join(work, "ssh.log")).read().count("connect") == connects_before,
+              "no reconnect, so the actor stays suspended")
+        await client.send(bytes([13]) + b"after-force")    # wakes it
+        while len(echoes) < len(typed) + 1:
+            echoes.append((await client.recv(timeout=30))[9:])
+        check(echoes == typed + [bytes([13]) + b"after-force"],
+              "every keystroke arrives once, in order, after the next wake", str(echoes[:3]))
+
         print("\n\033[1m8. the actor lost the session (restart, revert): the client is told\033[0m")
         reply = keeper_call(run, {"cmd": "park", "timeout": 10})
         anchor.kill()
@@ -362,8 +394,18 @@ async def main():
         s2.sendall(b'{"cmd":"park","timeout":5}\n')
         reply = json.loads(s2.recv(65536))
         check(reply.get("result") == "unsupported", "park refused, so hubctl won't suspend it", str(reply))
-        old.stdin.close()
-        await asyncio.wait_for(old.wait(), 10)
+        s2.close()
+
+        print("\n\033[1m9b. close (hubctl remove/delete): the keeper exits and doesn't reconnect\033[0m")
+        s3 = socket.socket(socket.AF_UNIX)
+        s3.settimeout(10)
+        s3.connect(sock_path)
+        s3.sendall(b'{"cmd":"close"}\n')
+        reply = json.loads(s3.recv(65536))
+        check(reply.get("result") == "closed", "close acknowledged", str(reply))
+        rc = await asyncio.wait_for(old.wait(), 10)
+        check(rc == 0, "keeper exited 0", f"(rc={rc})")
+        check(not os.path.exists(sock_path), "its control socket is gone")
 
         print("\n\033[1m10. a keeper takes over while input is in flight: nothing reaches the bridge twice\033[0m")
         await takeover_test(work, sock)

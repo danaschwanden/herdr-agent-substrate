@@ -7,6 +7,7 @@
 # while its actor is suspended. Everything else -- herdr's probes, scp-like
 # uploads, hubctl's calls (HERDR_KEEPER_BYPASS=1), interactive ssh -- runs the
 # real ssh unchanged.
+set -euo pipefail
 REAL_SSH="${HERDR_REAL_SSH:-/usr/bin/ssh}"
 if [[ -z "${HERDR_KEEPER_BYPASS:-}" && $# -ge 2 ]]; then
   target="${*: -2:1}"

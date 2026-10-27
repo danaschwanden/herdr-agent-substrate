@@ -826,7 +826,8 @@ Usage: $0 <command> [args]
   delete <name>     remove actor <name>: herdr machine, egress policy, actor
   attach            herdr TUI inside the hub
   web               the same TUI in your browser, at http://localhost:${WEB_PORT}/
-  suspend <name>    via the hub: park the client sessions, cut tunnel, suspend actor
+  suspend <name> [--force]
+                    via the hub: park the client sessions, cut tunnel, suspend actor
   resume <name>     via the hub: resume actor, wake the client sessions
   status            actors and herdr machines, as the hub sees them
   logs              follow the hub (idle bridge decisions)
@@ -852,7 +853,8 @@ main() {
     delete) cmd_delete "$@" ;;
     attach) cmd_attach "$@" ;;
     web) cmd_web ;;
-    suspend|resume) [[ -n "${1:-}" ]] || die "usage: $0 ${cmd} <name>"; hub hubctl "${cmd}" "$1" ;;
+    suspend) [[ -n "${1:-}" ]] || die "usage: $0 suspend <name> [--force]"; hub hubctl suspend "$@" ;;
+    resume) [[ -n "${1:-}" ]] || die "usage: $0 resume <name>"; hub hubctl resume "$1" ;;
     status) hub hubctl status ;;
     logs) k -n "${HUB_NAMESPACE}" logs -f deploy/herdr-hub ;;
     verify) cmd_verify "$@" ;;

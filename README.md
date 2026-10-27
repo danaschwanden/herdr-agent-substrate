@@ -539,6 +539,10 @@ as running, never at suspended ones, since polling would wake them. For each one
 - **Agents:** any agent `working` or `blocked`? It asks with `herdr --machine <actor> agent list`.
 - **Input:** has anyone typed into, or opened, the machine in an attached herdr client? The keepers report this.
 
+An actor whose agent list can't be read (the command fails or returns something unexpected) counts as busy, so it
+is never suspended under an agent the hub can't see; the hub log says so once, when it starts happening. The idle
+timer only ever moves forward: input from a while ago never undoes a more recent busy agent.
+
 An actor with neither for `IDLE_SECONDS` is suspended:
 
 1. Its keepers park. Each one waits until everything it sent is acknowledged and the actor has gone quiet, then
@@ -646,7 +650,8 @@ stateDiagram-v2
 - `actor NAME` creates the actor suspended, from the golden snapshot. `machine NAME`'s first ssh goes through the
   router, which resumes it, and then registers it with herdr.
 - *Idle or `suspend NAME`* parks the keepers, cuts leftover tunnels, then calls `SuspendActor`; the snapshot
-  uploads in the background. Input or a working or blocked agent resets the idle timer.
+  uploads in the background. Input or a working or blocked agent resets the idle timer (so does an agent list
+  that can't be read).
 - *Any connection* through the router wakes a suspended actor: input in a client, but also `verify`, `debug`, or
   herdr's probes when a client starts. Whatever woke it, the idle bridge suspends it again after `IDLE_SECONDS`.
 - `delete NAME` works from any state.
@@ -1206,7 +1211,9 @@ sequenceDiagram
 Both run in the hub, because the keepers live there and the order matters: they must be parked before the
 suspend. `hubctl idle-watch` runs the same suspend automatically (see [Lifecycle](#lifecycle)). `suspend` refuses
 while someone is typing, or when a keeper can't park; `suspend NAME --force` (in the hub: `hubctl suspend NAME
---force`) suspends anyway, and the next input wakes the actor again.
+--force`) suspends anyway, and the next input wakes the actor again. A forced park drops the keeper's connection
+without waiting: unacknowledged input and output stay buffered on both ends and are replayed on that next wake.
+Only keepers whose first connection isn't up yet, and actors from older images (plain relay), still can't park.
 
 #### `delete <name>`
 
@@ -1217,7 +1224,7 @@ sequenceDiagram
   participant H as hub pod
   participant A as ate-api
   S->>A: GetActor NAME, stop if missing
-  S->>H: hubctl remove NAME: herdr machine remove, kill tunnel
+  S->>H: hubctl remove NAME: herdr machine remove, close its keepers, kill tunnel
   S->>A: DeleteActorEgressPolicy NAME
   S->>A: DeleteActor NAME, discards its snapshot
 ```
@@ -1237,12 +1244,13 @@ hubctl delete mars
 
 - **`create`** does `actor` and `machine` in one go:
   - creates the actor from the kit's template (`herdr-agent`) in the hub's atespace;
-  - gives it the kit's egress policy, only `api.anthropic.com` with the key injected;
+  - gives it the kit's egress policy: the APIs of the agents in `AGENTS`, with their credentials injected;
   - saves it as a herdr machine, so it appears in every client's sidebar.
 
   Each part is skipped if it already exists, so a create that failed halfway can simply be re-run.
-- **`delete`** reverses it in the safe order: the machine first, so no client wakes the actor, then the egress
-  policy, then the actor and its snapshot.
+- **`delete`** reverses it in the safe order: the machine first, then any keeper still attached to it is closed
+  (a keeper that only lost its tunnel would reconnect and wake the actor), then the egress policy, then the actor
+  and its snapshot.
 - **A different egress policy** for one actor: `hubctl create mars --policy FILE`. The file has the same format
   as `manifests/egress-policy.yaml.tmpl`, for example with `api.github.com` added. An existing actor's policy is
   left alone; change it with `hubctl ate update egress-policy`.
@@ -1370,7 +1378,19 @@ The production guides add these. Their defaults are the quick start's.
 | `ACTOR_IMAGE` | — (what `image` built) | prebuilt actor image, by tag or digest ([Prebuilt images](#prebuilt-images-from-github)) |
 | `HUB_IMAGE` | — (what `hub-image` built) | prebuilt hub image; its substrate release must match the cluster's |
 | `HUB_WEB_ADDR` | `127.0.0.1` | where the hub's ttyd listens (applied by `hub`); `0.0.0.0` for a sign-in proxy in front, as in each guide's step 14 |
-| `HUB_WEB_AUTH_HEADER` | — | ttyd refuses requests without this header (applied by `hub`); the guides' oauth2-proxy sets `X-Forwarded-Email` |
+| `HUB_WEB_AUTH_HEADER` | — | ttyd refuses requests without this header (applied by `hub`); the guides' oauth2-proxy sets `X-Forwarded-Email`. The hub logs a warning when `HUB_WEB_ADDR` isn't loopback and this is empty |
+
+These are read by the hub container itself and aren't applied by `hub`. Set them on the Deployment, e.g.
+`kubectl -n herdr-hub set env deployment/herdr-hub IDLE_WATCH=false`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IDLE_WATCH` | `true` | `false` runs the hub without the idle bridge: nothing is suspended automatically |
+| `HUB_WEB` | `true` | `false` runs the hub without the web terminal |
+| `HUB_WEB_PORT` | `7681` | ttyd's port in the pod (the manifest's `containerPort` and Service assume 7681) |
+| `HERDR_KEEPER_CONNECT_TIMEOUT` | `120` | seconds a keeper keeps trying to open its first connection to an actor |
+| `HERDR_KEEPER_WAKE_TIMEOUT` | `180` | seconds a keeper keeps trying to reconnect (wake) a parked actor before it gives up |
+| `HERDR_KEEPER_MAX_UNACKED` | `33554432` (32 MiB) | client input a keeper buffers unacknowledged before it gives up on the session |
 
 ## Disk and resources (quick start)
 
@@ -1439,7 +1459,7 @@ fails in ways that look unrelated.
 | Always-on: real herdr TUI attached; idle agent → keeper parked → actor suspended, machine stays enabled | same, suspend emulated with `docker pause` | pass |
 | Suspended: luna shows online for 45 s of health checks; nothing reaches the router; a resize doesn't wake it | same | pass |
 | A typed command wakes it: router resumes the actor, keeper rejoins the same session, output on screen | same | container up in 0.16 s, session resumed in 0.38 s |
-| Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor, a takeover mid-stream delivers every byte exactly once | `test/keeper-test.py` | 26/26, 30 runs in a row; the code before the review fixes fails the reconnect check about 1 run in 4 and the takeover check every run |
+| Keeper and anchor: local pongs, held frames (latest only), 7 MB intact across a forced reconnect, park refused during input, lost session reported, plain relay for images without the anchor, a takeover mid-stream delivers every byte exactly once | `test/keeper-test.py` | 34/34 (forced park and close included), 30 runs in a row; the code before the review fixes fails the reconnect check about 1 run in 4 and the takeover check every run |
 | Web terminal: ttyd in the hub listens on loopback only; headless Chromium types a command that runs on luna and shows in the tmux client too; closing the tab ends its herdr client; a new tab on a suspended luna wakes it | `test/hub-path-test.sh` steps 1, 10, 11 (31/31 in all) | pass |
 | Web terminal: a mouse selection reaches the clipboard, right-click opens herdr's menu with the browser's suppressed, `ctrl+v` pastes into luna. ttyd's own page does none of the three | same, step 12; the same checks against ttyd's default page | pass; default page fails all three |
 | `web`: forwards, checks the page answers, stops the port-forward on exit; reports a proxy-only hub (407) clearly | script run against a stub kubectl and ttyd | pass |
@@ -1617,7 +1637,7 @@ the hub.
 | `deploy`: "no hub SSH key" | run `hub` (the key is kept on the hub's volume; `.state` is only a local copy) |
 | `herdr: cannot attach without a usable terminal: … zero-sized grid` | use `host/herdr-substrate.sh attach`, which sets the terminal size |
 | `error: unknown machine '<name>'` | the `machine <name>` step hasn't completed; run it |
-| `machine '<name>' is disabled` | disabled by hand, or by an older version of this kit. `herdr machine enable <id>` in the hub; `idle-watch` re-enables `ate-*` machines when the hub starts |
+| `machine '<name>' is disabled` | disabled by hand, or by an older version of this kit. `herdr machine enable <id>` in the hub. `idle-watch` re-enables `ate-*` machines once, the first time the hub starts with this version; a machine you disable after that stays disabled |
 | Claude Code: "Unable to connect to Anthropic services … platform.claude.com: ENOTFOUND" | actor built from an older image without pre-completed onboarding. In its pane: `python3 -c 'import json,os;p=os.path.expanduser("~/.claude.json");d=json.load(open(p)) if os.path.exists(p) else {};d["hasCompletedOnboarding"]=True;json.dump(d,open(p,"w"))'` |
 | `codex`: `401 Unauthorized` | `AGENTS` lacks `codex` (no egress rule or placeholder), or the OpenAI key is wrong. `verify <name>` shows which; changing `AGENTS` needs `down`, `hub`, `deploy` and new actors |
 | `codex`: "error sending request" / certificate errors | the gateway's CA isn't in the actor's system store (actor built before Codex support): rebuild with `image`, then `down` and `deploy` |
@@ -1696,3 +1716,19 @@ Fixes made while bringing the kit up on a real cluster, all included above:
   substrate's `ALL`, an IPv6 attempt that fails with "network unreachable" (kind on Docker Desktop) ended in a
   503 instead of falling back to IPv4. The new `egress-dns` command applies it to any cluster; both production
   guides run it after installing substrate. `EGRESS_DNS_FAMILY` overrides it.
+- **Hub review fixes:**
+  - **Idle timer:** it only moves forward. Before, input seen a while ago could overwrite a more recent busy
+    agent, and the actor was suspended early.
+  - **`suspend --force`:** a keeper that can't park cleanly now drops its connection anyway and replays what it
+    held on the next wake. Before, cutting its tunnel made it reconnect at once, which resumed the actor. The host
+    script now passes `--force` on to the hub.
+  - **`remove` and `delete`:** keepers still attached to the removed machine are closed before tunnels are cut,
+    so none reconnects and wakes the actor.
+  - **Smaller fixes:**
+    - An actor whose agent list can't be read is logged and documented (still counted as busy).
+    - Disabled machines are re-enabled only once, as a migration.
+    - `remove`, `suspend` and `resume` validate the actor name.
+    - The hub warns when the web terminal listens beyond loopback without `HUB_WEB_AUTH_HEADER`.
+    - The keeper's run directory is root-only at both levels.
+    - `ate-wss-proxy` fails clearly without an identity bundle.
+    - The hub image no longer installs tmux.

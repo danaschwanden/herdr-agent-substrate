@@ -10,8 +10,8 @@
 #   - routing: ate-target-actor: <ATESPACE>/<actor>, where <host> is
 #     "ate-<actor>". The router resumes the actor if it is suspended.
 #
-# Pod certificates rotate, so the PKCS#12 copy websocat needs is rebuilt
-# whenever the projected bundle is newer.
+# Pod certificates rotate, so the PKCS#12 copy websocat needs is cached by
+# the projected bundle's content and rebuilt whenever that changes.
 set -eu
 
 host="${1:?usage: ate-wss-proxy <ate-actor>}"
@@ -26,7 +26,9 @@ url="${ATE_ROUTER_URL:-wss://atenet-router.ate-system.svc:443/}"
 cache="${HOME}/.cache/herdr-hub"
 umask 077
 mkdir -p "${cache}"
+[ -s "${bundle}" ] || { echo "ate-wss-proxy: no identity bundle at ${bundle}" >&2; exit 1; }
 digest="$(sha256sum "${bundle}" | cut -c1-16)"
+[ -n "${digest}" ] || { echo "ate-wss-proxy: could not hash ${bundle}" >&2; exit 1; }
 p12="${cache}/identity-${digest}.p12"
 if [ ! -s "${p12}" ]; then
   # The bundle holds the private key followed by the certificate chain.

@@ -15,7 +15,7 @@ ARG TTYD_VERSION=1.7.7
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      openssh-client openssl ca-certificates curl tini python3 bash procps less tmux \
+      openssh-client openssl ca-certificates curl tini python3 bash procps less \
  && rm -rf /var/lib/apt/lists/*
 
 # Same pinned herdr and websocat as actor/Dockerfile: the hub's herdr must

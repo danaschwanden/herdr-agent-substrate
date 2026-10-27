@@ -11,7 +11,7 @@
 # unattended hub never keeps actors awake.
 set -euo pipefail
 
-# log and supervise, shared with the hub's entrypoint (common/service.sh).
+# log and supervise, shared with the actor's entrypoint (common/service.sh).
 # shellcheck disable=SC2034 # read by service.sh
 LOG_TAG=herdr-hub RESTART_DELAY=5
 for lib in /usr/local/lib/herdr-substrate/service.sh "$(dirname "$(readlink -f "$0")")/../common/service.sh"; do
@@ -91,6 +91,12 @@ else
             -t titleFixed=herdr -t disableLeaveAlert=true)
   [[ "${HUB_WEB_ADDR}" == "0.0.0.0" ]] || web_args+=(-i "${HUB_WEB_ADDR}")
   [[ -z "${HUB_WEB_AUTH_HEADER:-}" ]] || web_args+=(-H "${HUB_WEB_AUTH_HEADER}")
+  # A shared link must only ever be behind sign-in (README: Security notes).
+  if [[ "${HUB_WEB_ADDR}" != 127.* && "${HUB_WEB_ADDR}" != localhost \
+        && "${HUB_WEB_ADDR}" != ::1 && -z "${HUB_WEB_AUTH_HEADER:-}" ]]; then
+    log "WARNING: the web terminal listens on ${HUB_WEB_ADDR} without HUB_WEB_AUTH_HEADER;" \
+        "anyone who reaches that address gets a shell unless a sign-in proxy (IAP, oauth2-proxy) is the only way in"
+  fi
   # ttyd's page plus hub/herdr-web.js: herdr's copy (OSC 52) reaches the
   # browser's clipboard, its right-click menu isn't covered by the browser's,
   # and ctrl+v pastes.

@@ -104,7 +104,20 @@ run_case() {
   # shellcheck disable=SC2016
   AGENTS="${agents}" CLAUDE_AUTH="${auth}" bash -c 'source "$1/host/herdr-substrate.sh"
     render_egress_policy "$2/policy.yaml"
-    agent_env_yaml >"$2/env.yaml"' _ "${KIT_DIR}" "${WORK}"
+    agent_env_yaml >"$2/env.yaml"
+    export ATESPACE ACTOR_IMAGE=registry/herdr-actor@sha256:0 AUTHORIZED_KEYS_JSON="\"ssh-ed25519 AAAA test\""
+    AGENT_ENV="$(agent_env_yaml)" render "$1/manifests/actor-template.yaml.tmpl" >"$2/template.yaml"' _ "${KIT_DIR}" "${WORK}"
+  # The whole ActorTemplate must stay valid YAML with these placeholders in it.
+  python3 - "${WORK}/template.yaml" "${WORK}/env.yaml" >"${WORK}/template-check" 2>&1 <<'PY' \
+    && ok "ActorTemplate renders as valid YAML with $(cat "${WORK}/template-check")" \
+    || bad "ActorTemplate does not render: $(tail -n 2 "${WORK}/template-check")"
+import sys, yaml
+env = [e["name"] for e in yaml.safe_load(open(sys.argv[1]))["containers"][0]["env"]]
+want = [e["name"] for e in yaml.safe_load(open(sys.argv[2]))]
+missing = [n for n in want if n not in env]
+assert not missing, f"missing env {missing}"
+print(", ".join(want))
+PY
   python3 - "${WORK}/env.yaml" >"${WORK}/env" <<'PY'
 import sys, yaml
 for e in yaml.safe_load(open(sys.argv[1])):
